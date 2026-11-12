@@ -135,6 +135,12 @@ def symbol_hint(r):
         if name is None and slot in ("0", "1") and header and \
                 re.search(r"virtual\s+~" + re.escape(cls.split("::")[-1]) + r"\s*\(", header.read_text(encoding="utf-8", errors="replace")):
             name = "~"
+        if name is None and slot.startswith("-") and header and \
+                re.search(r"virtual\s+~" + re.escape(cls.split("::")[-1]) + r"\s*\(", header.read_text(encoding="utf-8", errors="replace")):
+            at, k = slot[1:].split(":")[:2]
+            kind = destructor_kind(cls, int(at), int(k))
+            if kind:
+                return f"_ZThn{at}_N{mangled}{kind}Ev"
         if name:
             if slot.startswith("-"):
                 at = slot[1:].split(":")[0]
@@ -189,6 +195,83 @@ def layout(cls, base=0, depth=0):
     for off, (t, n) in own_members(cls).items():
         out[base + off] = (t, n, cls)
     return out
+
+
+_primary = None
+
+
+def base_at(cls, at, depth=0):
+    """the class at offset `at` of cls (its bases', all the way down), the deepest first: the
+    one whose vtable sits there."""
+    layout(cls)                         # loads _bases
+    if at == 0 and depth:
+        return cls
+    for b, off in _bases.get(cls, []):
+        if off <= at:
+            found = base_at(b, at - off, depth + 1)
+            if found:
+                return found
+    return None
+
+
+_shown, _secondary = {}, None
+
+
+def shown(where):
+    """match.py show's text of a function (cached)."""
+    if where not in _shown:
+        _shown[where] = subprocess.run([sys.executable, "-I", str(config.ROOT / "tools" / "match.py"), "show", where],
+                                       capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+    return _shown[where]
+
+
+def target_where(target):
+    module, _, address = target.rpartition(":")
+    return f"0x{address}" if module == "code.bin" else f"{module}:0x{address}"
+
+
+def destructor_kind(cls, at, k):
+    """'D1' or 'D0' when slot k of the base at `at` is that base's destructor (vtables.csv: its
+    own primary vtable, the function's method in functions.csv), else None. a base with no
+    vtable of its own (an interface only ever a secondary base) is read from the class's
+    secondary vtable instead: of two neighbouring slots, the thunk that frees the object
+    (operator delete) is D0 and the other one D1."""
+    global _primary, _secondary
+    if _primary is None:
+        _primary, _secondary = {}, {}
+        with open(config.CONFIG / "vtables.csv", encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                if r["top"] == "0":
+                    _primary.setdefault(r["class"], {}).setdefault(int(r["slot"]), r["target"])
+                else:
+                    _secondary.setdefault((r["class"], -int(r["top"])), {}).setdefault(int(r["slot"]), r["target"])
+    if not _primary.get(base_at(cls, at) or "", {}):
+        slots = _secondary.get((cls, at), {})
+
+        def frees(i):
+            return i in slots and "_ZdlPv" in shown(target_where(slots[i]))
+        if k in slots and frees(k) and not frees(k - 1):
+            return "D0"
+        if k in slots and not frees(k) and frees(k + 1):
+            return "D1"
+        return None
+    base = base_at(cls, at)
+    while base is not None:
+        slots = _primary.get(base, {})
+
+        def is_dtor(i):
+            target = slots.get(i, "")
+            if ":" not in target:
+                return False
+            module, _, address = target.rpartition(":")
+            row = table().get((module, int(address, 16)))
+            return bool(row) and row["method"].startswith("~")
+        if k in slots:
+            if not is_dtor(k):
+                return None
+            return "D0" if is_dtor(k - 1) else "D1"
+        base = next((b for b, off in _bases.get(base, []) if off == 0), None)
+    return None
 
 
 def offsets_used(r):
@@ -391,8 +474,13 @@ def main():
             if declared:
                 known.append(f"- declared: `{declared.strip()}`")
             if r["slot"].startswith("-"):
-                known.append("- a thunk of a secondary base's vtable: write the override the header declares "
-                             "(the line above); the compiler makes this thunk from it, with this `//!` line")
+                if symbol_hint(r).endswith(("D1Ev", "D0Ev")):
+                    known.append("- a thunk of the class's destructor in a secondary base's vtable: the class's "
+                                 "virtual destructor makes it; write the destructor (its body as the class's own "
+                                 "D1/D0 shows it) and add this `//!` line above it")
+                else:
+                    known.append("- a thunk of a secondary base's vtable: write the override the header declares "
+                                 "(the line above); the compiler makes this thunk from it, with this `//!` line")
             used = members_used(r)
             if used:
                 known.append("- members it reads or writes through this (its class's and its bases', in "

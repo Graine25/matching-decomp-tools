@@ -941,9 +941,30 @@ def main():
                 img = images[where[0]]
                 return None if img is None else [img.word(a) for a in range(where[1], int(row["end"], 16), 4)]
 
-            def shape(ws):
+            def shape(ws, at=None):
+                """the body's words, branches, push, pop, returns and `sub r0, r0, #n` left out. a
+                thunk (at: its base's offset) may fold the adjustment into the body: its
+                `sub rd, r0, #at` is the override's `mov rd, r0`."""
                 out = Counter()
+                adjusted = at is not None        # r0 still holds the thunk's incoming pointer
                 for w in ws:
+                    if adjusted and (w & 0x0E000000) == 0x04000000 and (w >> 16) & 0xF == 0:
+                        # ldr/str rd, [r0, #x] before r0 is written: the override's [r0, #x + at]
+                        x = (w & 0xFFF) if w & 0x00800000 else -(w & 0xFFF)
+                        if 0 <= x + at < 0x1000:
+                            w = (w & ~0xFFF) | 0x00800000 | (x + at)
+                    writes_r0 = ((w & 0x0E000000) == 0x0A000000 and w & 0x01000000) \
+                        or (w & 0x0FFFFFF0) == 0x012FFF30 \
+                        or ((w & 0x0C000000) == 0x00000000 and (w >> 12) & 0xF == 0
+                            and not (0x8 <= (w >> 21) & 0xF <= 0xB and w & 0x00100000)) \
+                        or ((w & 0x0C100000) == 0x04100000 and (w >> 12) & 0xF == 0)
+                    if writes_r0:
+                        adjusted = False
+                    if at is not None and (w & 0x0FFF0000) == 0x02400000 and (w >> 12) & 0xF:
+                        rot = ((w >> 8) & 0xF) * 2
+                        value = ((w & 0xFF) >> rot | (w & 0xFF) << (32 - rot)) & 0xFFFFFFFF if rot else w & 0xFF
+                        if value == at:
+                            w = 0x01A00000 | (w & 0xF000)       # mov rd, r0
                     if (w & 0x0E000000) == 0x0A000000 or (w & 0x0FFF0000) in (0x092D0000, 0x08BD0000) \
                             or (w & 0x0FFFFFFF) in (0x01A00000, 0x012FFF1E) or (w & 0x0FFFF000) == 0x02400000:
                         continue
@@ -958,7 +979,7 @@ def main():
                     ws = words(where)
                     if ws is not None:
                         new[i] = (where, shape(ws))
-            taken = set()
+            taken, tied = set(), {}
             for (vmodule, _), (vcls, top, vslots) in m.vtables.items():
                 if vcls != cls or top == 0 or vmodule != module:
                     continue
@@ -980,7 +1001,7 @@ def main():
                         dest = where[1] + 4 + 8 + 4 * (off - 0x1000000 if off & 0x800000 else off)
                         best = next((i for i, (w2, _) in new.items() if w2[1] == dest), None)
                     if best is None:
-                        mine = shape(ws)
+                        mine = shape(ws, -top)
                         scored = []
                         for i, (_, theirs) in new.items():
                             if i in taken:
@@ -989,9 +1010,22 @@ def main():
                                 scored.append(i)
                         if len(scored) == 1:
                             best = scored[0]
+                        elif scored:
+                            tied.setdefault(frozenset(scored), []).append((where[1], base, k, -top, where))
                     if best is not None and best not in taken:
                         taken.add(best)
                         found[best] = (base, k, -top, f"{where[0]}:{where[1]:08X}")
+            # thunks whose bodies are all the same as the same slots' bodies: armlink places the
+            # functions in the order of their mangled names (--split_sections), and a thunk's name
+            # is its override's with _ZThn<n>_ before it, so the n-th thunk by address is the n-th
+            # of those slots by address
+            for slots_, thunks in tied.items():
+                free = sorted((i for i in slots_ if i not in taken), key=lambda i: new[i][0][1])
+                if len(free) != len(thunks):
+                    continue
+                for i, (_, base, k, at, where) in zip(free, sorted(thunks, key=lambda t: t[0])):
+                    taken.add(i)
+                    found[i] = (base, k, at, f"{where[0]}:{where[1]:08X}")
             return found
 
         def overriding_slot(base, k):
@@ -1028,8 +1062,11 @@ def main():
                 if new and i in overriders:
                     other, k, at, thunk = overriders[i]
                     declared = overriding_slot(other, k)
+                    # a name another slot of the class has, or another override took (two bases'
+                    # slots of one generated name: one function would override both), is left
                     if declared and declared[1] not in chain_names - {name} and declared[1] != name:
                         result, oname, params, const = declared
+                        chain_names.add(oname)
                         gap = "" if result.endswith("*") else " "
                         lines.append(f"    virtual {result}{gap}{oname}({params}){' const' if const else ''};  "
                                      f"// overrides {other}'s slot {k}, through the base at +{at:#x} (its thunk "
