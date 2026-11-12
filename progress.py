@@ -136,6 +136,15 @@ def main():
     (config.BUILD / "report.txt").write_text("status  where                   bytes diff open  source  symbol\n" + "\n".join(rows) + "\n",
                                              encoding="utf-8")
     (config.BUILD / "report.json").write_text(json.dumps(records, indent=1), encoding="utf-8")
+    # a function two sources match counts once (the same address in two files)
+    matched = {}
+    for r in records:
+        if r["status"] == "match":
+            matched.setdefault(r["where"], r["bytes"])
+    twice = totals.get("match", 0) - len(matched)
+    if twice:
+        print(f"{twice} matches of functions another source also matches (counted once)")
+    totals["match"], size["match"] = len(matched), sum(matched.values())
     for status in ("match", "hack", "match?", "differ", "error"):
         if status in totals:
             print(f"{status:7} {totals[status]:6} functions {size[status]:8} bytes")
@@ -155,11 +164,10 @@ def main():
     if total:
         print(f"matched: {done} of {total} bytes of code, import stubs left out ({100 * done / total:.4f}%)")
         own = 0
-        for r in records:
-            if r["status"] == "match":
-                module, _, off = r["where"].rpartition(":")
-                if config.own(functable.library(module or "code.bin", int(off, 16))):
-                    own += r["bytes"]
+        for where, nbytes in matched.items():
+            module, _, off = where.rpartition(":")
+            if config.own(functable.library(module or "code.bin", int(off, 16))):
+                own += nbytes
         print(f"of the game's own code ({', '.join(config.OWN)}, unknown): {own} of {target} bytes ({100 * own / target:.4f}%)")
 
 

@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 
 TABLE = [("functable.py",), ("rtti.py",), ("ctors.py",)]
-DERIVE = [("classify.py",), ("fields.py",), ("enums.py",), ("callers.py",), ("headers.py",), ("bounds.py",), ("progress.py",), ("tiny.py", "--max", "64")]
+DERIVE = [("classify.py",), ("fields.py",), ("enums.py",), ("callers.py",), ("headers.py",), ("bounds.py",), ("progress.py",), ("tiny.py", "--max", "64"), ("structors.py",), ("units.py",)]
 ALWAYS = [("progress.py",), ("twins.py", "--apply"), ("copies.py", "--apply"), ("progress.py",), ("honest.py",), ("status.py",)]
 # then the other versions: the same sources against each (their reports in build/<version>/)
 OTHERS = [(("progress.py",), version) for version in config.GAME_VERSIONS if version != config.MAIN]

@@ -30,7 +30,7 @@ The judge and the chain:
 
 | Tool | What |
 | --- | --- |
-| `match.py` | compiles a source and compares a function with the game's: relocations checked by symbol, the linker's own changes modelled (a call to an empty function is a NOP, to a one-instruction one that instruction, a tail call to the next function a NOP), C1/D1 as C2/D2, `_ZTV` vtables from the RTTI, Thumb |
+| `match.py` | compiles a source and compares a function with the game's: relocations checked by symbol, the linker's own changes modelled (a call to an empty function is a NOP, to a one-instruction one that instruction, a tail call to the next function a NOP), C1/D1 as C2/D2, `_ZTV` vtables and virtual destructors (D0, D1/D2) from the RTTI's vtables, Thumb |
 | `honest.py` | finds the tricks a source can reach the bytes with (weak, volatile, asm, goto, a vtable stored by hand...) |
 | `progress.py`, `status.py`, `refresh.py` | every `//!` function checked (cached), the progress picture, the chain in order |
 | `versions.py` | maps another version of the game onto the main one, function by function |
@@ -59,6 +59,7 @@ Writing functions without a person:
 | Tool | What |
 | --- | --- |
 | `tiny.py` | writes small functions from their instructions (paths of conditional branches, calls, calls through import stubs and vtables) and keeps what matches |
+| `structors.py` | the virtual destructors from the class's header, against both slots of its vtable: `X::~X() {}`, or the body it reads before the members and bases are destroyed (calls on `this`, a member or a global; `delete` of a pointer member; a member set to 0; `if (this->m)` around them); never a body that may be an inlined base's; a match also proves the class's bases and members |
 | `imports.py` | a call through a module's import stub written as a call to the real function |
 | `twins.py`, `copies.py` | a matched source tried at functions with the same code (other constants, other modules) |
 | `units.py` | a file per translation unit, from the static initializers |

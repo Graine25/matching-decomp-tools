@@ -187,6 +187,10 @@ def symbol_address(name, image):
         at = vtable_address(name[4:], image.name[:-4] if image.name.endswith(".cro") else image.name)
         if at is not None:
             return (None, image.translate(at - 8))
+    # a virtual destructor: where the class's vtable in this program says it is
+    at = destructor_address(name, image.name[:-4] if image.name.endswith(".cro") else image.name)
+    if at is not None:
+        return (None, image.translate(at))
     # a complete-object constructor or destructor (C1, D1) of a class with no virtual base is
     # its base-object one (C2, D2): armcc calls the first, the game exports the second
     m = re.fullmatch(r"(_Z.*[CD])1(E.*)", name)
@@ -221,6 +225,50 @@ def vtable_address(mangled, module):
                     if key and r["top"] == "0":
                         _vtables.setdefault((r["module"], key), set()).add(int(r["vtable"], 16))
     found = _vtables.get((module, mangled), set())
+    return next(iter(found)) if len(found) == 1 else None
+
+
+_dtor_slots = None
+
+
+def destructor_address(name, module):
+    """the address of a virtual destructor (_ZN<class>D0Ev, D1Ev, D2Ev) in a program, from the
+    class's primary vtable there: slot 0 the complete one (D1, which is D2 without virtual
+    bases), slot 1 the deleting one (D0). only when the table names that slot's function a
+    destructor of the class (functions.csv's method `~<class>`)."""
+    global _dtor_slots
+    m = re.fullmatch(r"_ZN((?:\d+[A-Za-z_]\w*?)+)D([012])Ev", name)
+    if not m:
+        return None
+    parts, pos, body = [], 0, m.group(1)
+    while pos < len(body):
+        n = re.match(r"\d+", body[pos:])
+        length = int(n.group(0))
+        pos += len(n.group(0))
+        parts.append(body[pos:pos + length])
+        pos += length
+    if pos != len(body):
+        return None
+    cls = "::".join(parts)
+    if _dtor_slots is None:
+        _dtor_slots = {}
+        import csv
+        methods = {}
+        with open(config.CONFIG / "functions.csv", encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                methods[(r["module"], int(r["start"], 16))] = r["method"]
+        with open(config.CONFIG / "vtables.csv", encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                if r["top"] != "0" or r["slot"] not in ("0", "1"):
+                    continue
+                target_module, _, addr = r["target"].rpartition(":")
+                if target_module != r["module"] or not re.fullmatch(r"[0-9A-Fa-f]+", addr):
+                    continue
+                at = int(addr, 16)
+                if not methods.get((target_module, at), "").startswith("~"):
+                    continue
+                _dtor_slots.setdefault((r["module"], r["class"], int(r["slot"])), set()).add(at)
+    found = _dtor_slots.get((module, cls, 1 if m.group(2) == "0" else 0), set())
     return next(iter(found)) if len(found) == 1 else None
 
 

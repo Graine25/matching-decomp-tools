@@ -118,7 +118,12 @@ def main():
     records = json.loads(report.read_text(encoding="utf-8"))
     sizes = modules()
     done, hack, count = dict.fromkeys(sizes, 0), dict.fromkeys(sizes, 0), {}
+    seen = set()
     for r in records:
+        if r["status"] == "match":          # a function two sources match counts once
+            if r["where"] in seen:
+                continue
+            seen.add(r["where"])
         module = r["where"].split(":")[0] if ":" in r["where"] else "code.bin"
         module = module[:-4] if module.endswith(".cro") else module
         count[r["status"]] = count.get(r["status"], 0) + 1

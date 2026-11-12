@@ -29,6 +29,7 @@ import functable
 import match
 
 CHUNK = 300
+PARENTS = 4                     # sources tried for one function, each from another matched twin
 TARGET = tuple(config.OWN) + ("",)
 
 
@@ -164,11 +165,18 @@ def main():
     if not a.apply:
         return
 
-    # candidates: the matched twin's source with the values of each unwritten one
-    candidates = []
+    # candidates: the matched twin's source with the values of each unwritten one. a function
+    # gets up to PARENTS of them, each from another matched member of its family (another
+    # source): the first that matches is kept, so what is written does not depend on which
+    # member happened to come first
+    alternatives = {}
     for done, todo in reachable:
         for module, start, end, values in todo:
+            alternatives[(module, start)] = mine = []
+            sources_seen = set()
             for d_module, d_start, _, d_values in done:
+                if len(mine) >= PARENTS:
+                    break
                 # a function found by a symbol of the compiler's (a static initializer) has no
                 # addresses in its source: it fits the executable and the modules alike
                 named = not re.search(r"[0-9A-Fa-f]{8}", matched[(d_module, d_start)]["symbol"])
@@ -185,20 +193,24 @@ def main():
                 if not ok:
                     continue
                 r = matched[(d_module, d_start)]
+                if r["source"] in sources_seen:
+                    continue
                 src = source_of(config.ROOT / r["source"], r["where"])
                 if not src:
                     continue
+                sources_seen.add(r["source"])
                 head, text = src
                 where = f"0x{start:08X}" if module == "code.bin" else f"{module}:0x{start:08X}"
                 ours = f"sub_{start:08X}" if module == "code.bin" else f"f_{module}_{start:08X}"
                 # a function the compiler names itself (a file's static initializer) keeps the
                 # symbol it is found by, and can only be alone in its file
                 alone = not re.search(r"[0-9A-Fa-f]{8}", r["symbol"])
-                candidates.append((module, start, where, r["symbol"] if alone else ours,
-                                   [substitute(l, mapping, d_module, module) for l in head],
-                                   substitute(text, mapping, d_module, module), alone))
-                break
-    print(f"{len(candidates)} candidates", flush=True)
+                mine.append((module, start, where, r["symbol"] if alone else ours,
+                             [substitute(l, mapping, d_module, module) for l in head],
+                             substitute(text, mapping, d_module, module), alone))
+    alternatives = {k: v for k, v in alternatives.items() if v}
+    print(f"{len(alternatives)} functions with a candidate, "
+          f"{sum(len(v) for v in alternatives.values())} candidates", flush=True)
 
     def write(path, group, note):
         seen, head = set(), []
@@ -221,40 +233,50 @@ def main():
 
     work = config.BUILD / "twins"
     work.mkdir(parents=True, exist_ok=True)
-    won = []
-    single = [c for c in candidates if c[6]]
-    for n, c in enumerate(single):
-        path = work / f"unit_{c[0].replace('.', '_')}_{c[1]:08X}.cpp"
-        write(path, [c], "candidate of tools/twins.py")
-        if match.check_many(path, [(c[2], c[3])])[0][0] == "match":
-            out = config.program_dir(c[0]) / "units" / f"unit_{c[1]:08X}.cpp"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            write(out, [c], f"a file of {c[0]}, known so far only by its static initializer (written by tools/twins.py)")
-            won.append(c)
-        if n % 200 == 199:
-            print(f"  {n + 1} of {len(single)} files, {len(won)} match", flush=True)
-    alone_won = len(won)
-    by_module = {}
-    for c in candidates:
-        if not c[6]:
-            by_module.setdefault(c[0], []).append(c)
-    for size in (CHUNK, 1):                                 # alone, a twin is not inlined into its caller
-        left = {}
-        for module, group in by_module.items():
-            for n in range(0, len(group), size):
-                part = group[n:n + size]
-                path = work / f"{module.replace('.', '_')}_{size}_{n // size:04}.cpp"
-                write(path, part, "candidates of tools/twins.py")
-                for c, result in zip(part, match.check_many(path, [(c[2], c[3]) for c in part])):
-                    if result[0] == "match":
-                        won.append(c)
-                    else:
-                        left.setdefault(module, []).append(c)
-        by_module = {m: g for m, g in left.items()}
-        if sum(len(g) for g in by_module.values()) > 400:
+    won_units, won_funcs, done_keys = [], [], set()
+    for level in range(PARENTS):
+        candidates = [alts[level] for key, alts in alternatives.items()
+                      if key not in done_keys and len(alts) > level]
+        if not candidates:
             break
+        single = [c for c in candidates if c[6]]
+        for n, c in enumerate(single):
+            path = work / f"unit_{c[0].replace('.', '_')}_{c[1]:08X}.cpp"
+            write(path, [c], "candidate of tools/twins.py")
+            if match.check_many(path, [(c[2], c[3])])[0][0] == "match":
+                out = config.program_dir(c[0]) / "generated" / "units" / f"unit_{c[1]:08X}.cpp"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                write(out, [c], f"a file of {c[0]}, known so far only by its static initializer (written by tools/twins.py)")
+                won_units.append(c)
+                done_keys.add((c[0], c[1]))
+            if n % 200 == 199:
+                print(f"  {n + 1} of {len(single)} files, {len(won_units)} match", flush=True)
+        by_module = {}
+        for c in candidates:
+            if not c[6]:
+                by_module.setdefault(c[0], []).append(c)
+        for size in (CHUNK, 1):                             # alone, a twin is not inlined into its caller
+            left = {}
+            for module, group in by_module.items():
+                for n in range(0, len(group), size):
+                    part = group[n:n + size]
+                    path = work / f"{module.replace('.', '_')}_{level}_{size}_{n // size:04}.cpp"
+                    write(path, part, "candidates of tools/twins.py")
+                    for c, result in zip(part, match.check_many(path, [(c[2], c[3]) for c in part])):
+                        if result[0] == "match":
+                            won_funcs.append(c)
+                            done_keys.add((c[0], c[1]))
+                        else:
+                            left.setdefault(module, []).append(c)
+            by_module = {m: g for m, g in left.items()}
+            if sum(len(g) for g in by_module.values()) > 400:
+                break
+        print(f"  parent {level + 1}: {len(done_keys)} match", flush=True)
+    won = won_units + won_funcs
+    alone_won = len(won_units)
+    candidates = list(alternatives)
     grouped = {}
-    for c in won[alone_won:]:
+    for c in won_funcs:
         grouped.setdefault(c[0], []).append(c)
     for module, group in grouped.items():
         out = config.program_dir(module) / "generated"
@@ -263,7 +285,7 @@ def main():
         for i in range(0, len(group), CHUNK):
             write(out / f"twins_{n + i // CHUNK:03}.cpp", group[i:i + CHUNK],
                   "written by tools/twins.py: the source of a matched twin with this function's values; each matches")
-    print(f"{len(won)} of {len(candidates)} match: {alone_won} unit files (src/<program>/units), {len(won) - alone_won} functions (src/<program>/generated)")
+    print(f"{len(won)} of {len(candidates)} match: {alone_won} unit files (src/<program>/generated/units), {len(won) - alone_won} functions (src/<program>/generated)")
 
 
 if __name__ == "__main__":

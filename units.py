@@ -12,7 +12,7 @@ for every unmatched function that builds such objects this reads the classes,
 takes the last class of each run of a derivation chain as an included header
 (a derived class's header includes its base's), tries the file with and
 without the engine's constant (UnitConstant.h), and keeps what matches as
-src/<program>/units/unit_<address>.cpp. an initializer that also sets the
+src/<program>/generated/units/unit_<address>.cpp. an initializer that also sets the
 file's own statics does not match and stays open. a class without a written
 header (one that has the NodeTrait base) is skipped, and listed.
 
@@ -126,7 +126,7 @@ def main():
             path = work / f"{module.replace('.', '_')}_{start:08X}.cpp"
             path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
             if match.check_many(path, [(where, "__sti__")])[0][0] == "match":
-                out = config.program_dir(module) / "units" / f"unit_{start:08X}.cpp"
+                out = config.program_dir(module) / "generated" / "units" / f"unit_{start:08X}.cpp"
                 out.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, out)
                 wrote += 1
