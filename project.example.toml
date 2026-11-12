@@ -1,0 +1,33 @@
+# a decomp project's project.toml: what the tools need to know of it. put it at the project's
+# root (the folder with orig/, config/, src/, include/, toolchain/) and run the tools from there.
+# a subset of TOML: [sections], key = "string" | integer | ["list", "of", "strings"], # comments.
+
+[project]
+name = "my-decomp"
+main = "us-v1.0"                 # the version of the tables, of every //! address and sub_ name
+own = ["game"]                   # the libraries to decompile (unknown ones are always counted too)
+
+[versions]                       # every version of the game, and the id GAME_VERSION gets
+"us-v1.0" = 1
+"eu-v1.0" = 2
+
+[compiler]                       # a build of toolchain/armcc/<version>/<build>, and its flags
+default = "4.1/b1049"
+flags = "--cpu=MPCore --arm --fpmode=fast --apcs=/interwork -O3 -Otime --split_sections"
+
+[libraries]                      # the first namespace of a name -> the library it is from
+nn = "sdk"
+std = "armlib"
+__rw = "armlib"
+__cxxabiv1 = "armlib"
+
+[library_files]                  # a source file the game names -> its library
+
+[paths]                          # local helpers only (local/), relative to project.toml
+ida_databases = "build/ida"
+ghidra_project = "build/ghidra-project"
+ghidra_install = "../ghidra"
+
+[ghidra]                         # local/ghidra_server.py
+name = "project"
+port = 18970
