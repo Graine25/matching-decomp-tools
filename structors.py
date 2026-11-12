@@ -1,7 +1,16 @@
-"""writes the virtual destructors from the classes' headers and what their code does before the
-members and the bases are destroyed, each kept only if it matches.
+"""writes the virtual destructors and the default constructors from the classes' headers, with
+what their code does besides building or destroying the bases and the members, each kept only if
+it matches.
 
   python -I tools/structors.py [--module NAME ...] [--dry]
+
+constructors: a class whose header declares `X();` (tools/headers.py does when ctors.csv has a
+constructor of it that reads nothing but this) gets `X::X() { ... }` against each of those
+constructors still open. the calls of the bases' and members' constructors come first and are
+the compiler's (from the header); then the vtables; what follows is the body, read as for a
+destructor, constants stored to members included. a store to a member of a base is never
+written: it is the base's constructor, inlined, which the compiler makes from the base's header
+(when that header does not define it inline, the source differs, as it should).
 
 a virtual destructor with an empty body (`X::~X() {}`) is all the compiler's: it stores the
 vtable, destroys the members and the bases, and the deleting one (D0) frees the object. so a
@@ -23,6 +32,13 @@ when a member's or a base's destructor is called after it, or the class has no b
 base's destructor was inlined, what comes before the return may be the base's body, and
 writing it as the class's own would put it in the wrong class. anything else (a call the linker removed, other
 arguments, branches of its own) leaves the body unread, and the empty body is tried.
+
+a base whose header defines virtual functions in the class (inline: its destructor, a slot
+with a body) has them emitted again in every program that uses its vtable, by the file of a
+class built on it. so in each program its copies (the base's vtable there) are named by `//!`
+lines in the file of one derived class this tool writes: one that matches, or else one whose own
+function does not match yet (written without its `//!`, and saying so). only the copies that
+match are kept.
 
 a match proves more than the function: the class's bases and the members that have
 destructors are as the game has them. only the classes of the libraries to decompile, and
@@ -92,13 +108,17 @@ class Tables:
 
     def members(self, cls, base=0, depth=0):
         """{offset: (name, type)} of a class with its bases' members."""
+        return {off: v[:2] for off, v in self.owned_members(cls, base, depth).items()}
+
+    def owned_members(self, cls, base=0, depth=0):
+        """{offset: (name, type, the class that declares it)} of a class with its bases'."""
         out = {}
         if depth > 8:
             return out
         for b, off in self.bases.get(cls, []):
-            out.update(self.members(b, base + off, depth + 1))
-        for off, v in self.own_members(cls).items():
-            out[base + off] = v
+            out.update(self.owned_members(b, base + off, depth + 1))
+        for off, (name, type_) in self.own_members(cls).items():
+            out[base + off] = (name, type_, cls)
         return out
 
 
@@ -130,9 +150,11 @@ def pointee(type_text):
     return m.group(1) if m else None
 
 
-def read_body(module, start, cls):
-    """(statements, includes, declarations) of a destructor's body, or raises Skip."""
+def read_body(module, start, cls, kind="dtor"):
+    """(statements, includes, declarations) of a destructor's (kind 'dtor') or a default
+    constructor's ('ctor') body, or raises Skip."""
     t = tables()
+    owned = t.owned_members(cls)
     image = t.image(module)
     row = t.rows.get((module, start))
     if row is None or row["mode"] != "arm":
@@ -265,6 +287,20 @@ def read_body(module, start, cls):
             for r in (A.ARM_REG_R0, A.ARM_REG_R1, A.ARM_REG_R2, A.ARM_REG_R3, A.ARM_REG_R12):
                 regs.pop(r, None)
             continue
+        if x.id in (A.ARM_INS_STRB, A.ARM_INS_STRH) and len(o) == 2 and o[1].type == A.ARM_OP_MEM:
+            mem, v = o[1].mem, regs.get(o[0].reg)
+            base = regs.get(mem.base)
+            if mem.index or not base or base[0] != "this" or cond or not v or v[0] != "const" \
+                    or (v[1] != 0 and kind != "ctor"):
+                raise Skip("a store")
+            off = base[1] + mem.disp
+            if off in owned and owned[off][2] != cls:
+                if kind == "ctor":
+                    continue            # the base's constructor, inlined: the compiler's, from its header
+                raise Skip("a store to a base's member")
+            width = 1 if x.id == A.ARM_INS_STRB else 2
+            stmts.append(f"this->{member(off)[0]} = {v[1] & ((1 << (8 * width)) - 1)};")
+            continue
         if x.id in (A.ARM_INS_STR,) and len(o) == 2 and o[1].type == A.ARM_OP_MEM:
             mem, v = o[1].mem, regs.get(o[0].reg)
             base = regs.get(mem.base)
@@ -273,8 +309,13 @@ def read_body(module, start, cls):
             off = base[1] + mem.disp
             if v and v[0] == "const" and (module, v[1]) in t.vtables:
                 continue                # a vtable: the compiler's
-            if v and v[0] == "const" and v[1] == 0:
-                stmts.append(f"this->{member(off)[0]} = 0;")
+            if v and v[0] == "const" and (v[1] == 0 or kind == "ctor"):
+                if off in owned and owned[off][2] != cls:
+                    if kind == "ctor":
+                        continue        # the base's constructor, inlined: the compiler's, from its header
+                    raise Skip("a store to a base's member")
+                value = v[1] if v[1] < 0x80000000 else v[1] - 0x100000000
+                stmts.append(f"this->{member(off)[0]} = {value};")
                 continue
             raise Skip("a store")
         if x.id in (A.ARM_INS_BL, A.ARM_INS_B) and o and o[0].type == A.ARM_OP_IMM and not cond:
@@ -282,7 +323,21 @@ def read_body(module, start, cls):
             callee = t.rows.get((module, target))
             stub = callee is not None and callee["kind"] == "stub"
             name = (callee or {}).get("name", "")
-            if (callee and (callee["method"].startswith("~") or "::~" in name)):
+            short_of = (callee or {}).get("class", "").rsplit("::", 1)[-1]
+            is_ctor = callee is not None and (
+                (callee["method"] and callee["method"] == short_of) or
+                (name and "::" in name and name.rsplit("::", 1)[1] == name.rsplit("::", 1)[0].rsplit("::", 1)[-1]))
+            if kind == "ctor" and is_ctor:
+                if top or block:
+                    raise Skip("a constructor called after the body")
+                if (regs.get(A.ARM_REG_R0) or ("",))[0] != "this":
+                    raise Skip("a constructor of something else")
+                passed = regs.get(A.ARM_REG_R0)
+                for r in (A.ARM_REG_R0, A.ARM_REG_R1, A.ARM_REG_R2, A.ARM_REG_R3, A.ARM_REG_R12):
+                    regs.pop(r, None)
+                regs[A.ARM_REG_R0] = passed        # a constructor returns its this
+                continue
+            if kind == "dtor" and (callee and (callee["method"].startswith("~") or "::~" in name)):
                 if block:
                     raise Skip("a destructor called in a block")
                 ended_by_destructor = True
@@ -318,7 +373,7 @@ def read_body(module, start, cls):
         raise Skip(f"an instruction: {x.mnemonic}")
     if block:
         close()
-    if top and not ended_by_destructor and t.bases.get(cls):
+    if kind == "dtor" and top and not ended_by_destructor and t.bases.get(cls):
         # no base's destructor is called: it was inlined, and what was read may be its body
         raise Skip("the base's destructor is inlined here: the body may be the base's")
     return top, includes, decls
@@ -342,15 +397,23 @@ def where_of(module, addr):
     return f"0x{addr:08X}" if module == "code.bin" else f"{module}:0x{addr:08X}"
 
 
+_elsewhere = None
+
+
 def matched_elsewhere():
-    """the functions that some source other than this tool's already matches."""
+    """the functions that some source other than this tool's already matches (read once)."""
+    global _elsewhere
+    if _elsewhere is not None:
+        return _elsewhere
     path = config.BUILD / "report.json"
     if not path.exists():
-        return set()
+        _elsewhere = set()
+        return _elsewhere
     out = set()
     for d in json.loads(path.read_text(encoding="utf-8")):
         if d["status"] == "match" and "/generated/dtors_" not in d["source"].replace("\\", "/"):
             out.add(d["where"])
+    _elsewhere = out
     return out
 
 
@@ -405,19 +468,136 @@ def candidates(modules):
     return found, skipped
 
 
+def declares_default_constructor(path, short):
+    return re.search(r"^\s+" + re.escape(short) + r"\s*\(\s*\)\s*;", path.read_text(encoding="utf-8", errors="replace"),
+                     re.M) is not None
+
+
+def ctor_candidates(modules):
+    """[(module, class, [(where, symbol)], body, 'ctor')] of the open default constructors."""
+    t = tables()
+    done = matched_elsewhere()
+    found, skipped = [], []
+    with open(config.CONFIG / "ctors.csv", encoding="utf-8", newline="") as f:
+        rows = [r for r in csv.DictReader(f) if r["kind"] == "ctor"]
+    for r in rows:
+        module, cls, addr = r["module"], r["class"], int(r["function"], 16)
+        if modules and module not in modules:
+            continue
+        row = t.rows.get((module, addr))
+        where = where_of(module, addr)
+        if row is None or not config.own(row["library"]) or where in done or row["mode"] != "arm":
+            continue
+        got = slotargs.args_of(t.image(module), addr, int(row["end"], 16))
+        if got is None or got[0] > 1 or got[1]:
+            continue                    # not a default constructor
+        if not PLAIN.fullmatch(cls) or header_of(cls) is None:
+            skipped.append((where, "constructor: no header of its own"))
+            continue
+        if not declares_default_constructor(header_of(cls), cls.split("::")[-1]):
+            skipped.append((where, "constructor: the header does not declare X()"))
+            continue
+        mangled = "".join(f"{len(p)}{p}" for p in cls.split("::"))
+        try:
+            body = read_body(module, addr, cls, "ctor")
+        except Skip as why:
+            body = ([], set(), [], str(why))
+        found.append((module, cls, [(where, mangled + "C1Ev")], body, "ctor"))
+    return found, skipped
+
+
+def mangled_name(cls):
+    return "".join(f"{len(p)}{p}" for p in cls.split("::"))
+
+
+_inline = {}
+
+
+def inline_virtuals(cls):
+    """{slot: symbol} of the virtual functions a class's header defines in the class."""
+    if cls not in _inline:
+        out = {}
+        path = header_of(cls) if PLAIN.fullmatch(cls) else None
+        if path:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            short, mangled = cls.split("::")[-1], mangled_name(cls)
+            if re.search(r"virtual\s+~" + re.escape(short) + r"\s*\(\s*\)\s*\{", text):
+                out[0], out[1] = mangled + "D1Ev", mangled + "D0Ev"
+            for m in re.finditer(r"virtual\s+[^;{}()]*?\b(\w+)\s*\([^()]*\)[^;{}\n]*\{[^\n]*?//\s*slot\s+(\d+)", text):
+                out[int(m.group(2))] = mangled + f"{len(m.group(1))}{m.group(1)}"
+        _inline[cls] = out
+    return _inline[cls]
+
+
+def ancestors(cls, depth=0):
+    """the classes a class is built on, all the way up (remembered)."""
+    if depth == 0 and cls in _ancestors:
+        return _ancestors[cls]
+    out = []
+    if depth > 8:
+        return out
+    for b, _ in tables().bases.get(cls, []):
+        out.append(b)
+        out += ancestors(b, depth + 1)
+    if depth == 0:
+        _ancestors[cls] = out
+    return out
+
+
+_vtable_rows = None
+_ancestors = {}
+
+
+def inline_copies(module, classes):
+    """{base: [(where, symbol)]} of the inline virtual functions of the bases of these classes
+    that this program has a copy of and no other source matches."""
+    wanted = {b for cls, *_ in classes for b in ancestors(cls) if inline_virtuals(b)}
+    if not wanted:
+        return {}
+    done = matched_elsewhere()
+    out = {}
+    global _vtable_rows
+    if _vtable_rows is None:            # read once: {module: [rows of its primary vtables]}
+        _vtable_rows = {}
+        with open(config.CONFIG / "vtables.csv", encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                if r["top"] == "0":
+                    _vtable_rows.setdefault(r["module"], []).append(r)
+    if True:
+        for r in _vtable_rows.get(module, []):
+            if r["class"] not in wanted:
+                continue
+            sym = inline_virtuals(r["class"]).get(int(r["slot"]))
+            target_module, _, addr = r["target"].rpartition(":")
+            if not sym or target_module != module or not re.fullmatch(r"[0-9A-Fa-f]+", addr):
+                continue
+            where = where_of(module, int(addr, 16))
+            if where not in done and (where, sym) not in out.get(r["class"], []):
+                out.setdefault(r["class"], []).append((where, sym))
+    return out
+
+
 def source(classes, note):
     lines = [f"// {note}", ""]
     includes, decls = set(), []
-    for cls, _, body in classes:
+    for cls, _, body, *_ in classes:
         parts = cls.split("::")
         includes.add("/".join(parts[:-1] + [parts[-1] + ".h"]))
         includes |= body[1]
         decls += [d for d in body[2] if d not in decls]
     lines += [f'#include "{h}"' for h in sorted(includes)] + [""] + decls + ([""] if decls else [])
-    for cls, items, body in classes:
+    for cls, items, body, *rest in classes:
+        kind = rest[:1]
+        extra = rest[1] if len(rest) > 1 else []
+        for base, copies in extra:
+            lines.append(f"// {base}'s inline virtual functions, emitted here with its vtable:")
+            lines += [f"//! {where} {sym}" for where, sym in copies]
+        if not items:
+            lines.append("// (this one does not match yet; it is here for the copies above)")
         for where, sym in items:
             lines.append(f"//! {where} {sym}")
-        head = f"{cls}::~{cls.split('::')[-1]}()"
+        tilde = "" if kind and kind[0] == "ctor" else "~"
+        head = f"{cls}::{tilde}{cls.split('::')[-1]}()"
         if body[0]:
             lines += [head + " {"] + [f"    {st}" for st in body[0]] + ["}"]
         else:
@@ -430,7 +610,7 @@ def check(path, classes, note):
     """{where: status} for these classes, compiled together; a chunk that does not compile is
     split until each class is alone."""
     path.write_text(source(classes, note), encoding="utf-8", newline="\n")
-    items = [it for _, its, _ in classes for it in its]
+    items = [it for _, its, *_ in classes for it in its]
     results = match.check_many(path, items)
     if all(r[0] == "error" for r in results) and len(classes) > 1:
         half = len(classes) // 2
@@ -440,50 +620,126 @@ def check(path, classes, note):
     return {where: r[0] for (where, _), r in zip(items, results)}
 
 
+def write_checked(out, name, entries, note, start=0):
+    """writes entries to out/<name>_NNN.cpp, each file checked as written: a file where something
+    does not match (two classes' headers that do not go together) is split until each entry is
+    alone, and an entry that still does not match is left out. returns (files written, the
+    entries kept)."""
+    if not entries:
+        return start, []
+    path = out / f"{name}_{start:03}.cpp"
+    path.write_text(source(entries, note), encoding="utf-8", newline="\n")
+    items = [it for e in entries for it in e[1]] + [c for e in entries for _, cs in (e[4] if len(e) > 4 else []) for c in cs]
+    results = match.check_many(path, items)
+    if all(r[0] == "match" for r in results):
+        return start + 1, entries
+    path.unlink()
+    if len(entries) == 1:
+        return start, []
+    half = len(entries) // 2
+    n, first = write_checked(out, name, entries[:half], note, start)
+    n, second = write_checked(out, name, entries[half:], note, n)
+    return n, first + second
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--module", nargs="*")
     p.add_argument("--dry", action="store_true", help="only count the candidates")
     a = p.parse_args()                  # argparse stops on an unknown argument
     found, skipped = candidates(a.module)
-    print(f"{len(found)} classes, {sum(len(i) for _, _, i, _ in found)} destructors to try; {len(skipped)} not", flush=True)
+    found = [f + ("dtor",) for f in found]
+    ctors, ctor_skipped = ctor_candidates(a.module)
+    found += ctors
+    skipped += ctor_skipped
+    print(f"{sum(1 for f in found if f[4] == 'dtor')} destructors' classes, {len(ctors)} constructors to try; "
+          f"{len(skipped)} not", flush=True)
     if a.dry:
         return
     work = config.BUILD / "structors"
     work.mkdir(parents=True, exist_ok=True)
-    read = sum(1 for *_, body in found if body[0])
+    read = sum(1 for f in found if f[3][0])
     print(f"bodies read: {read}", flush=True)
     by_module = {}
-    for module, cls, items, body in found:
-        by_module.setdefault(module, []).append((cls, items, body))
+    for module, cls, items, body, kind in found:
+        by_module.setdefault(module, []).append((cls, items, body, kind))
     won = 0
+    # every program's chunks checked side by side; a chunk that does not compile is split after
+    jobs = []
     for module, classes in sorted(by_module.items()):
-        status = {}
         for i in range(0, len(classes), CHUNK):
-            chunk = classes[i:i + CHUNK]
-            status.update(check(work / f"{module.replace('.', '_')}_{i // CHUNK:03}.cpp", chunk,
-                                "candidates of tools/structors.py"))
+            path = work / f"{module.replace('.', '_')}_{i // CHUNK:03}.cpp"
+            jobs.append((module, classes[i:i + CHUNK], path))
+    first = {}
+    checked = match.check_parallel([(p, [it for _, its, *_ in chunk for it in its],
+                                     source(chunk, "candidates of tools/structors.py")) for _, chunk, p in jobs])
+    for (module, chunk, path), (results, _) in zip(jobs, checked):
+        items = [it for _, its, *_ in chunk for it in its]
+        if all(r[0] == "error" for r in results) and len(chunk) > 1:
+            first.setdefault(module, {}).update(check(path, chunk, "candidates of tools/structors.py"))
+        else:
+            first.setdefault(module, {}).update({w: r[0] for (w, _), r in zip(items, results)})
+    for module, classes in sorted(by_module.items()):
+        status = first.get(module, {})
         keep = []
-        for cls, items, body in classes:
+        for cls, items, body, kind in classes:
             good = [(w, s) for w, s in items if status.get(w) == "match"]
             unread = f"; its body: {body[3]}" if len(body) > 3 else ""
             skipped += [(w, f"does not match ({status.get(w, 'error')}){unread}") for w, s in items
                         if status.get(w) != "match"]
             if good:
-                keep.append((cls, good, body))
+                keep.append((cls, good, body, kind))
+        # the bases' inline virtual functions: in the file of one class built on each base
+        hosted = []
+        for base, copies in sorted(inline_copies(module, classes).items()):
+            # a host: a class built on the base, one that matches first, destructors before
+            # constructors (a constructor may leave the base's vtable out); the first of a few
+            # whose file emits the most copies
+            hosts = [e for e in keep if base in ancestors(e[0])]
+            hosts += [(c, [], b, k) for c, _, b, k in classes if base in ancestors(c)
+                      and not any(c == h[0] and k == h[3] for h in hosts)]
+            hosts.sort(key=lambda e: (not e[1], e[3] != "dtor"))
+            best, best_good, best_results = None, [], None
+            for host in hosts[:6]:
+                host = (host[0], host[1], host[2], host[3])
+                path = work / f"{module.replace('.', '_')}_inline.cpp"
+                path.write_text(source([host + ([(base, copies)],)], "candidates of tools/structors.py"),
+                                encoding="utf-8", newline="\n")
+                results = match.check_many(path, host[1] + copies)
+                good = [c for c, r in zip(copies, results[len(host[1]):]) if r[0] == "match"]
+                if best is None or len(good) > len(best_good):
+                    best, best_good, best_results = host, good, results
+                if len(good) == len(copies):
+                    break
+            if best is None:
+                continue
+            skipped += [(w, f"{base}'s inline copy: does not match ({r[0]})")
+                        for (w, _), r in zip(copies, best_results[len(best[1]):]) if r[0] != "match"]
+            if best_good or best[1]:
+                keep[:] = [e for e in keep if not (e[0] == best[0] and e[3] == best[3])]
+                hosted.append(best + ([(base, best_good)] if best_good else [],))
         out = config.program_dir(module) / "generated"
         for old in out.glob("dtors_*.cpp"):
             old.unlink()
+        out.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for entry in hosted:
+            n, kept = write_checked(out, "dtors_inline", [entry],
+                                    "written by tools/structors.py: a class built on a base whose header defines "
+                                    "virtual functions inline, and the base's copies this file emits; each named one matches", n)
+            won += sum(len(e[1]) + sum(len(c) for _, c in e[4]) for e in kept)
+        n, written = 0, []
         for i in range(0, len(keep), CHUNK):
-            out.mkdir(parents=True, exist_ok=True)
-            (out / f"dtors_{i // CHUNK:03}.cpp").write_text(
-                source(keep[i:i + CHUNK], "written by tools/structors.py: virtual destructors from the headers; each matches"),
-                encoding="utf-8", newline="\n")
-        won += sum(len(g) for _, g, _ in keep)
-        print(f"{module}: {sum(len(g) for _, g, _ in keep)} of {sum(len(i) for _, i, _ in classes)}", flush=True)
+            n, kept = write_checked(out, "dtors", keep[i:i + CHUNK],
+                                    "written by tools/structors.py: destructors and constructors from the headers; each matches", n)
+            written += kept
+        lost = {w for e in keep for w, _ in e[1]} - {w for e in written for w, _ in e[1]}
+        skipped += [(w, "matches alone, not beside the other classes of its file") for w in sorted(lost)]
+        won += sum(len(g) for _, g, *_ in written)
+        print(f"{module}: {sum(len(g) for _, g, *_ in written)} of {sum(len(i) for _, i, *_ in classes)}", flush=True)
     with open(config.BUILD / "structors_skipped.txt", "w", encoding="utf-8", newline="\n") as f:
         f.writelines(f"{where} {why}\n" for where, why in skipped)
-    print(f"{won} destructors in src/<program>/generated/dtors_*.cpp; {len(skipped)} left "
+    print(f"{won} destructors and constructors in src/<program>/generated/dtors_*.cpp; {len(skipped)} left "
           f"(build/{config.VERSION}/structors_skipped.txt)")
 
 

@@ -210,12 +210,70 @@ def load(interfaces=False):
             base = basename(known_name)
             if base:
                 votes.setdefault((introducer(cls, i), i), Counter())[("~" if base.startswith("~") else base)] += 1
+    # the code's own word: a slot whose function frees the object (calls operator delete) right
+    # after a slot whose function does not is the deleting destructor (D0) after the complete one
+    # (D1). this names the destructor of a class whose first slot is another function (an
+    # interface with a virtual first), which no name and no vtable store tells
+    deleting = deleters(index)
+    named = set(votes)                  # a slot a name gives is never renamed by this
+    for cls, (module, slots) in primary.items():
+        for i in range(len(slots) - 1):
+            first, second = target_function(slots[i][0]), target_function(slots[i + 1][0])
+            keys = [(introducer(cls, k), k) for k in (i, i + 1)]
+            if any(k in named for k in keys):
+                continue
+            if first in index and second in index and deleting.get(second) and deleting.get(first) is False:
+                for key in keys:
+                    votes.setdefault(key, Counter())["~"] += 1
     slot_name = {key: c.most_common(1)[0][0] for key, c in votes.items()}
 
     m = Model()
     m.rows, m.index, m.parents, m.vtables, m.primary = rows, index, parents, vtables, primary
     m.slot_name, m.introducer, m.target_function, m.up = slot_name, introducer, target_function, up
     return m
+
+
+def deleters(index):
+    """{(module, start): whether the function ends by freeing its object} for the ARM functions of
+    the table: its last instruction a tail call (b) to `operator delete` (or to a module's import
+    stub of it), the function nothing else or `this` put back in r0 just before (a deleting
+    destructor: `mov r0, r4; pop {r4, lr}; b operator delete`). a function that deletes something
+    else on its way (a member) is not one."""
+    targets = {k for k, r in index.items() if r["name"] in ("operator.delete", "operator delete")}
+    out, images = {}, {}
+    for (module, start), r in index.items():
+        if r["mode"] != "arm" or r["kind"] == "stub":
+            continue
+        end = int(r["end"], 16)
+        if end - start > 512:
+            out[(module, start)] = None             # too long to be a destructor worth naming so
+            continue
+        if module not in images:
+            try:
+                images[module] = config.Image(module)
+            except OSError:
+                images[module] = None
+        image = images[module]
+        if image is None:
+            continue
+        words = [image.word(at) for at in range(start, end, 4)]
+        last = None                     # the last branch: the function's end (a pool may follow)
+        for n, w in enumerate(words):
+            if (w & 0x0F000000) == 0x0A000000 and (w >> 28) == 0xE:
+                last = n
+            if (w & 0x0FFFFFFF) in (0x012FFF1E,) or (w & 0x0FFF8000) == 0x08BD8000:
+                break                   # bx lr, pop {..., pc}: a return before any tail call
+        found = False
+        if last is not None:
+            w = words[last]
+            off = w & 0xFFFFFF
+            t = start + 4 * last + 8 + 4 * (off - 0x1000000 if off & 0x800000 else off)
+            if (module, t) in targets:
+                # nothing else, or r0 set again from a saved register (this) shortly before
+                found = last == 0 or any((x & 0x0FFFF000) == 0x01A00000 and (x & 0xF) in (4, 5, 6, 7)
+                                         for x in words[max(0, last - 3):last])
+        out[(module, start)] = found
+    return out
 
 
 def dtors():

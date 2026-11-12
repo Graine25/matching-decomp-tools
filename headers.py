@@ -579,6 +579,30 @@ def main():
             best = (max(best[0], found[0]), max(best[1], found[1]))
         if any_found and best != (0, 0):
             slot_params[key] = best
+    # a default constructor: a function of ctors.csv that reads nothing but this (r0) and no float
+    # (tools/slotargs.py). declared `X();` so that it can be written, and so that what builds an
+    # X calls it, as the game does, instead of an implicit one the compiler inlines
+    default_ctor = {}
+    ctors_path = config.CONFIG / "ctors.csv"
+    if ctors_path.exists():
+        with open(ctors_path, encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                if r["kind"] != "ctor" or r["class"] in default_ctor:
+                    continue
+                addr = int(r["function"], 16)
+                row = function_of.get((r["module"], addr))
+                if row is None or row["mode"] != "arm":
+                    continue
+                if r["module"] not in images:
+                    try:
+                        images[r["module"]] = config.Image(r["module"])
+                    except OSError:
+                        images[r["module"]] = None
+                if images[r["module"]] is None:
+                    continue
+                found = slotargs.args_of(images[r["module"]], addr, int(row["end"], 16))
+                if found is not None and found[0] <= 1 and found[1] == 0:
+                    default_ctor[r["class"]] = f"{r['module']}:{addr:08X}"
     inside = classes | named
 
     def declarable(sig, home=None, cls=None):
@@ -978,6 +1002,8 @@ def main():
                 if text not in said:
                     said.add(text)
                     plain_lines.append(f"{text}  // {where}")
+            if cls in default_ctor and not any(t.lstrip().startswith(f"{short}(") for t in said):
+                lines.insert(0, f"    {short}();  // a constructor, {default_ctor[cls]}: it reads nothing but this (ctors.csv)")
             if plain_lines:
                 if lines:
                     lines.append("")

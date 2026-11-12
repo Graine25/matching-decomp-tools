@@ -213,6 +213,9 @@ def main():
           f"{sum(len(v) for v in alternatives.values())} candidates", flush=True)
 
     def write(path, group, note):
+        path.write_text(text_of(group, note), encoding="utf-8", newline="\n")
+
+    def text_of(group, note):
         seen, head = set(), []
         for c in group:
             for line in c[4]:
@@ -226,10 +229,8 @@ def main():
             names = re.findall(r"\b(?:(?:sub|data|f|t)_\w+|_Z\w+)", l)
             if not l.lstrip().startswith("#") and (not names or used.intersection(names)):
                 rest.append(l)
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(f"// {note}\n\n" + "".join(l + "\n" for l in includes) + "\n" + "".join(l + "\n" for l in rest) + "\n")
-            for c in group:
-                f.write(f"//! {c[2]} {c[3]}\n{c[5]}\n")
+        return (f"// {note}\n\n" + "".join(l + "\n" for l in includes) + "\n" + "".join(l + "\n" for l in rest) + "\n"
+                + "".join(f"//! {c[2]} {c[3]}\n{c[5]}\n" for c in group))
 
     work = config.BUILD / "twins"
     work.mkdir(parents=True, exist_ok=True)
@@ -240,34 +241,35 @@ def main():
         if not candidates:
             break
         single = [c for c in candidates if c[6]]
-        for n, c in enumerate(single):
-            path = work / f"unit_{c[0].replace('.', '_')}_{c[1]:08X}.cpp"
-            write(path, [c], "candidate of tools/twins.py")
-            if match.check_many(path, [(c[2], c[3])])[0][0] == "match":
+        jobs = [(work / f"unit_{c[0].replace('.', '_')}_{c[1]:08X}_{level}.cpp", [(c[2], c[3])],
+                 text_of([c], "candidate of tools/twins.py")) for c in single]
+        for c, (result, _) in zip(single, match.check_parallel(jobs)):
+            if result[0][0] == "match":
                 out = config.program_dir(c[0]) / "generated" / "units" / f"unit_{c[1]:08X}.cpp"
                 out.parent.mkdir(parents=True, exist_ok=True)
                 write(out, [c], f"a file of {c[0]}, known so far only by its static initializer (written by tools/twins.py)")
                 won_units.append(c)
                 done_keys.add((c[0], c[1]))
-            if n % 200 == 199:
-                print(f"  {n + 1} of {len(single)} files, {len(won_units)} match", flush=True)
         by_module = {}
         for c in candidates:
             if not c[6]:
                 by_module.setdefault(c[0], []).append(c)
         for size in (CHUNK, 1):                             # alone, a twin is not inlined into its caller
-            left = {}
+            left, jobs = {}, []
             for module, group in by_module.items():
                 for n in range(0, len(group), size):
                     part = group[n:n + size]
                     path = work / f"{module.replace('.', '_')}_{level}_{size}_{n // size:04}.cpp"
-                    write(path, part, "candidates of tools/twins.py")
-                    for c, result in zip(part, match.check_many(path, [(c[2], c[3]) for c in part])):
-                        if result[0] == "match":
-                            won_funcs.append(c)
-                            done_keys.add((c[0], c[1]))
-                        else:
-                            left.setdefault(module, []).append(c)
+                    jobs.append((module, part, path))
+            checked = match.check_parallel([(p, [(c[2], c[3]) for c in part], text_of(part, "candidates of tools/twins.py"))
+                                            for _, part, p in jobs])
+            for (module, part, _), (results, _) in zip(jobs, checked):
+                for c, result in zip(part, results):
+                    if result[0] == "match":
+                        won_funcs.append(c)
+                        done_keys.add((c[0], c[1]))
+                    else:
+                        left.setdefault(module, []).append(c)
             by_module = {m: g for m, g in left.items()}
             if sum(len(g) for g in by_module.values()) > 400:
                 break

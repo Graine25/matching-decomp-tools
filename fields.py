@@ -21,6 +21,10 @@ an access belongs to the class or to one of its bases: it is given to the base w
 known extent holds it (bases come first in an object), else to the class. a base that
 another base follows in some class is no larger than the distance between the two.
 
+a pointer member's class shows also where the object is made: the word a constructor's call
+returns, stored right after it to this + n (`bl Y::Y` then `str r0, [this, #n]`), says the member
+at n points to a Y (the destructors that delete it through its vtable need that type).
+
 an object inside the class shows another way: `add r0, this, #n` and then a call to a
 constructor, a destructor or a member function of a known class says that an object of
 that class lies at n (when n is not where a base of the class is).
@@ -229,7 +233,7 @@ def accesses(image, start, end, this=0):
                 if merged != states[n]:
                     states[n] = merged
                     work.append(n)
-    found, stores_vtable, calls, points = set(), False, set(), set()
+    found, stores_vtable, calls, points, made = set(), False, set(), set(), set()
     for at, (state, loaded) in states.items():
         w = image.word(at)
         step(w, state, loaded, lambda off, width, kind: found.add((off, width, kind)))
@@ -244,7 +248,22 @@ def accesses(image, start, end, this=0):
         if (w & 0x0F000000) == 0x0B000000 and (w >> 28) == 0xE and 0 in loaded and 0 not in state:
             off = w & 0xFFFFFF
             points.add((loaded[0], at + 8 + 4 * (off - 0x1000000 if off & 0x800000 else off)))
-    return found, stores_vtable, calls, points
+        # bl, then its result stored to this + n before r0 is written again: what the callee
+        # returns is kept in that member (collect() keeps it when the callee is a constructor)
+        if (w & 0x0F000000) == 0x0B000000 and (w >> 28) == 0xE:
+            off = w & 0xFFFFFF
+            target = at + 8 + 4 * (off - 0x1000000 if off & 0x800000 else off)
+            for nxt in (at + 4, at + 8):
+                if nxt not in states or not start <= nxt < end:
+                    break
+                v = image.word(nxt)
+                rn, rd = (v >> 16) & 0xF, (v >> 12) & 0xF
+                if (v & 0xFFF00000) == 0xE5800000 and rd == 0 and states[nxt][0].get(rn) == 0:
+                    made.add((v & 0xFFF, target))         # str r0, [this, #n]
+                    break
+                if (v >> 28) != 0xE or rd == 0 or (v & 0x0E000000) in (0x0A000000, 0x08000000):
+                    break                                 # r0 written, a branch, or conditional
+    return found, stores_vtable, calls, points, made
 
 
 def first_parameter_is_value(demangled):
@@ -331,10 +350,18 @@ def collect():
             cls = d[:d.index("(")].rsplit("::", 1)[0]
             if cls in classes:
                 todo[("code.bin", int(r["address"], 16))] = (cls, False, 1 if r["mangled"] in by_name else 0)
+    constructors = set()                # (module, start) of every constructor, and the import stubs of one
     with open(config.CONFIG / "ctors.csv", encoding="utf-8", newline="") as f:
         for r in csv.DictReader(f):
+            if r["kind"] == "ctor":
+                constructors.add((r["module"], int(r["function"], 16)))
             if r["top"] == "0":
                 todo.setdefault((r["module"], int(r["function"], 16)), (r["class"], True, 0))
+    for r in m.rows:
+        if r["kind"] == "stub" and "::" in r["name"]:
+            owner, _, last = r["name"].rpartition("::")
+            if last == owner.rsplit("::", 1)[-1]:
+                constructors.add((r["module"], int(r["start"], 16)))
     for r in m.rows:
         if r["class"] and r["slot"] and not r["slot"].startswith("-") and r["method"] != "shared" and r["mode"] == "arm":
             this = 0
@@ -382,6 +409,10 @@ def collect():
         for off, target in got[3]:
             inner = lands.get((module, target))
             if inner and 0 <= off < LIMIT:
+                pointers[cls][(off, inner)] += 1
+        for off, target in got[4]:
+            inner = lands.get((module, target))
+            if inner and (module, target) in constructors and 0 < off < LIMIT and off not in base_offsets:
                 pointers[cls][(off, inner)] += 1
     print(f"{used} functions followed ({skipped} left out: a computed jump, or a constructor inlined in another function)")
     return m, seen, objects, pointers

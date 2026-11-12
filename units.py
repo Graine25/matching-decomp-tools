@@ -108,7 +108,8 @@ def main():
     work = config.BUILD / "units"
     work.mkdir(parents=True, exist_ok=True)
     wrote, missing, failed = 0, Counter(), 0
-    for n, (module, start, order) in enumerate(found):
+    todo = []                           # (module, start, where, includes)
+    for module, start, order in found:
         pairs = [pair(s) for s in order]
         unknown = [c for c, _ in pairs if header_of(c) is None]
         if unknown:
@@ -118,23 +119,31 @@ def main():
         # the last class of each run of a chain is a header the file includes
         includes = [header_of(c) for i, (c, _) in enumerate(pairs) if i + 1 == len(pairs) or pairs[i + 1][1] != c]
         where = f"0x{start:08X}" if module == "code.bin" else f"{module}:0x{start:08X}"
-        done = False
-        for constant in (True, False):
+        todo.append((module, start, where, includes))
+    # with the constant's header first, then without it for what that did not match; each pass
+    # checked side by side (match.check_parallel)
+    for constant in (True, False):
+        paths, texts = [], []
+        for module, start, where, includes in todo:
             lines = [f"// a file of {module}, known so far only by its static initializer (written by tools/units.py)", ""]
             lines += [f'#include "{h}"' for h in ([CONSTANT] if constant else []) + includes]
             lines += ["", f"//! {where} __sti__", ""]
-            path = work / f"{module.replace('.', '_')}_{start:08X}.cpp"
-            path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
-            if match.check_many(path, [(where, "__sti__")])[0][0] == "match":
-                out = config.program_dir(module) / "generated" / "units" / f"unit_{start:08X}.cpp"
+            path = work / f"{module.replace('.', '_')}_{start:08X}_{'c' if constant else 'p'}.cpp"
+            paths.append(path)
+            texts.append("\n".join(lines))
+        results = match.check_parallel([(p, [(t[2], "__sti__")], x) for p, t, x in zip(paths, todo, texts)])
+        left = []
+        for text, t, (result, _) in zip(texts, todo, results):
+            if result[0][0] == "match":
+                out = config.program_dir(t[0]) / "generated" / "units" / f"unit_{t[1]:08X}.cpp"
                 out.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(path, out)
+                out.write_text(text, encoding="utf-8", newline="\n")
                 wrote += 1
-                done = True
-                break
-        failed += not done
-        if n % 100 == 99:
-            print(f"  {n + 1} of {len(found)}: {wrote} written", flush=True)
+            else:
+                left.append(t)
+        print(f"  {'with' if constant else 'without'} the constant: {wrote} written", flush=True)
+        todo = left
+    failed = len(todo)
     print(f"{len(found)} initializers build node Inheritance objects: {wrote} written, {failed} with more in them "
           f"(left open), {sum(1 for _ in found) - wrote - failed} with a class that has no header yet")
     for cls, count in missing.most_common():

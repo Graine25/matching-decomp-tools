@@ -870,19 +870,22 @@ def chunks(funcs, pick):
 
 
 def write(path, chunk, note):
+    path.write_text(text_of(chunk, note), encoding="utf-8", newline="\n")
+
+
+def text_of(chunk, note):
     decls, seen = [], set()
     for f, (text, need) in chunk["funcs"]:
         for d in need:
             if d not in seen:
                 seen.add(d)
                 decls.append(d)
-    with open(path, "w", encoding="utf-8", newline="\n") as out:
-        out.write(f"// {note}\n\n#include \"types.h\"\n\n")
-        out.write("".join(d + "\n" for d in decls) + ("\n" if decls else ""))
-        for (module, start, ours, where, name, _, _), (text, _) in chunk["funcs"]:
-            if name:
-                out.write(f"// {name}\n")
-            out.write(f"//! {where} {ours}\n{text}\n")
+    parts = [f"// {note}\n\n#include \"types.h\"\n\n", "".join(d + "\n" for d in decls) + ("\n" if decls else "")]
+    for (module, start, ours, where, name, _, _), (text, _) in chunk["funcs"]:
+        if name:
+            parts.append(f"// {name}\n")
+        parts.append(f"//! {where} {ours}\n{text}\n")
+    return "".join(parts)
 
 
 def main():
@@ -913,16 +916,18 @@ def main():
         by_module = {}
         for f in left:
             by_module.setdefault(f[0], []).append(f)
+        jobs = []
         for module, funcs in by_module.items():
             for i, chunk in enumerate(chunks(funcs, lambda f: f[5][level])):
                 path = work / f"{module.replace('.', '_')}_v{level}_{i:03}.cpp"
-                write(path, chunk, "candidates of tools/tiny.py")
-                items = [(f[3], f[2]) for f, _ in chunk["funcs"]]
-                for (f, variant), result in zip(chunk["funcs"], match.check_many(path, items)):
-                    if result[0] == "match":
-                        won[(f[0], f[1])] = variant
-                if match.last_hacks:
-                    print(f"{path.name}: {', '.join(match.last_hacks)[:300]}")
+                jobs.append((path, chunk, [(f[3], f[2]) for f, _ in chunk["funcs"]]))
+        checked = match.check_parallel([(p, it, text_of(c, "candidates of tools/tiny.py")) for p, c, it in jobs])
+        for (path, chunk, _), (results, hacks) in zip(jobs, checked):
+            for (f, variant), result in zip(chunk["funcs"], results):
+                if result[0] == "match":
+                    won[(f[0], f[1])] = variant
+            if hacks:
+                print(f"{path.name}: {', '.join(hacks)[:300]}")
         print(f"variant {level + 1}: {len(won)} match", flush=True)
 
     files = 0

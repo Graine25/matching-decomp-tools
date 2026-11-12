@@ -49,17 +49,17 @@ The structure, from the game's own code and RTTI:
 
 | Tool | What |
 | --- | --- |
-| `rtti.py`, `ctors.py`, `classify.py` | classes and vtables from the RTTI, who writes each vtable, each function's class, slot, method and library |
+| `rtti.py`, `ctors.py`, `classify.py` | classes and vtables from the RTTI, who writes each vtable, each function's class, slot, method and library (a slot pair is the destructor when the second one's last word is the tail call that frees the object) |
 | `fields.py` | data members from how functions use `this`; pointers typed by what they are passed to; objects inside |
 | `enums.py`, `callers.py`, `slotargs.py` | enums and their sizes from the callers; return types from what callers do; a function's parameters from what it reads |
-| `headers.py` | a header per class: bases, virtual functions by slot, members (offsets checked by the compiler); a hand-written header's slots and size followed by the classes built on it |
+| `headers.py` | a header per class: bases, virtual functions by slot, members (offsets checked by the compiler), `X();` when the class has a constructor that reads nothing but `this`; a hand-written header's slots and size followed by the classes built on it |
 
 Writing functions without a person:
 
 | Tool | What |
 | --- | --- |
 | `tiny.py` | writes small functions from their instructions (paths of conditional branches, calls, calls through import stubs and vtables) and keeps what matches |
-| `structors.py` | the virtual destructors from the class's header, against both slots of its vtable: `X::~X() {}`, or the body it reads before the members and bases are destroyed (calls on `this`, a member or a global; `delete` of a pointer member; a member set to 0; `if (this->m)` around them); never a body that may be an inlined base's; a match also proves the class's bases and members |
+| `structors.py` | the virtual destructors and the default constructors from the class's header: `X::~X() {}` / `X::X() {}`, or the body it reads besides what builds or destroys the bases and members (calls on `this`, a member or a global; `delete` of a pointer member; constants stored to members; `if (this->m)` around them); never code that may be an inlined base's; a match also proves the class's bases and members |
 | `imports.py` | a call through a module's import stub written as a call to the real function |
 | `twins.py`, `copies.py` | a matched source tried at functions with the same code (other constants, other modules) |
 | `units.py` | a file per translation unit, from the static initializers |
@@ -73,6 +73,13 @@ GPL-3.0 and is run as an outside program, nothing of it is in this repository. I
 context made from the project's tables (a struct per class with its members and vtable, prototypes
 with `this` typed) and puts the C++ names back in what comes out; its `ctr` target (VFP, floats in
 `s` registers) is in a local fork of m2c, `project.toml [paths] m2c`; `ccsweep.py`).
+
+`match.py` keeps every result of a check in `build/<version>/check_cache.sqlite`, by what it
+depends on (the source and the headers it includes, the compiler and flags, the functions'
+entries, and what the judge reads): a check made again costs no compile. `check_parallel` checks
+many sources side by side; the generators (`tiny.py`, `structors.py`, `twins.py`, `units.py`)
+use both, and write a candidate's file only when its result is not kept. The file can be
+deleted at any time: it changes no result, only saves remaking it.
 
 objdiff shows fewer functions as the same than `match.py` does: it has no model of what the linker
 changed (a call the linker made a NOP is a `bl` in the object and a `mov r0, r0` in the game), so

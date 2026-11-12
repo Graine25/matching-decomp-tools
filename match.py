@@ -30,6 +30,7 @@ function, or the other way round, differs.
 """
 import argparse
 import bisect
+import os
 import re
 import struct
 import subprocess
@@ -574,11 +575,213 @@ def check(source, where, sym=None, cc=None, flags=None, quiet=False, keep=None, 
     return status, len(diffs), len(opens), len(code)
 
 
+# results of check_many kept in build/<version>/check_cache/, by what they depend on: the
+# source and every header it includes, the compiler and flags, the version, the functions'
+# entries in the table, and what the judge reads (this file, honest.py, config.py, the flag
+# sets, the allowed tricks, symbols.txt, the vtables and the destructors' names). a tool that
+# checks the same candidate again gets its result without a compile.
+_INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
+_stamp = None
+_header_keys = {}
+
+
+def judge_stamp():
+    global _stamp
+    if _stamp is None:
+        import hashlib
+        h = hashlib.sha1()
+        tools = Path(__file__).resolve().parent
+        for f in (tools / "match.py", tools / "honest.py", tools / "config.py",
+                  config.CONFIG / "flagsets.txt", config.CONFIG / "honest_allow.txt", config.CONFIG / "symbols.txt",
+                  config.CONFIG / "vtables.csv", config.ROOT / "config" / config.VERSION / "map.csv"):
+            h.update(f.read_bytes() if f.exists() else b"-")
+        path = config.CONFIG / "functions.csv"
+        if path.exists():                       # the destructors' names (destructor_address)
+            import csv
+            with open(path, encoding="utf-8", newline="") as f:
+                for r in csv.DictReader(f):
+                    if r["method"].startswith("~"):
+                        h.update(f"{r['module']}:{r['start']}:{r['class']}|".encode())
+        _stamp = h.hexdigest()
+    return _stamp
+
+
+_found_includes = {}
+
+
+def _include(inc, folder, extra):
+    """where an #include "inc" of a file in folder lands (its folder, the -I folders given,
+    then include/), as a normalized path string, or None. remembered: on Windows a stat or a
+    resolve costs more than the hashing."""
+    key = (inc, folder, extra)
+    if key not in _found_includes:
+        _found_includes[key] = None
+        for base in (folder, *extra, str(config.ROOT / "include")):
+            candidate = os.path.join(base, inc)
+            if os.path.isfile(candidate):
+                _found_includes[key] = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
+                break
+    return _found_includes[key]
+
+
+def text_key(text, folder, extra=()):
+    """header_key of a file's text given in memory, as if it were in folder."""
+    import hashlib
+    h = hashlib.sha1(text.encode("utf-8"))
+    for inc in _INCLUDE.findall(text):
+        found = _include(inc, folder, extra)
+        if found:
+            h.update(header_key(found, ("<text>",), extra).encode())
+    return h.hexdigest()
+
+
+def header_key(path, stack=(), extra=()):
+    """a hash of a file and of every header it includes (path: a normalized string). a header's
+    hash is remembered for the run; the file a tool checks is read each time."""
+    key = (path, extra)
+    if key in _header_keys:
+        return _header_keys[key]
+    if path in stack:
+        return "-"
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return "-"
+    h = hashlib.sha1(data)
+    folder = os.path.dirname(path)
+    for inc in _INCLUDE.findall(data.decode("utf-8", errors="replace")):
+        found = _include(inc, folder, extra)
+        if found:
+            h.update(header_key(found, stack + (path,), extra).encode())
+    if stack:                           # a header: the same for the whole run
+        _header_keys[key] = h.hexdigest()
+    return h.hexdigest()
+
+
+def cache_key(source, items, cc, flags, lint, text=None):
+    """the key of a check's result. text: the source's text when it is not on disk yet."""
+    import hashlib
+    extra = tuple(os.path.normcase(os.path.abspath(p)) for p in re.findall(r"-I\s*(\S+)", flags))
+    h = hashlib.sha1(judge_stamp().encode())
+    h.update(f"{cc}|{flags}|{config.version_define()}|{lint}|".encode())
+    path = os.path.normcase(os.path.abspath(str(source)))
+    if text is None:
+        h.update(header_key(path, (), extra).encode())
+    else:
+        h.update(text_key(text, os.path.dirname(path), extra).encode())
+    table = functable.table()
+    for where, sym in items:
+        module, _, addr = where.rpartition(":")
+        try:
+            entry = table.get(module or "code.bin", {}).get(int(addr, 16))
+        except ValueError:
+            entry = None
+        h.update(f"{where}|{sym}|{entry!r}|".encode())
+    return h.hexdigest()
+
+
+_db = None
+
+
+def cache_db():
+    """the results kept, one SQLite file (build/<version>/check_cache.sqlite): one open for a
+    whole run instead of one per result, and the processes of check_parallel share it."""
+    global _db
+    if _db is None:
+        import sqlite3
+        config.BUILD.mkdir(parents=True, exist_ok=True)
+        _db = sqlite3.connect(str(config.BUILD / "check_cache.sqlite"), timeout=60)
+        _db.execute("PRAGMA journal_mode=WAL")
+        _db.execute("CREATE TABLE IF NOT EXISTS kept (key TEXT PRIMARY KEY, value TEXT)")
+    return _db
+
+
+def cache_get(key):
+    import json
+    row = cache_db().execute("SELECT value FROM kept WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return None
+    data = json.loads(row[0])
+    return [tuple(r) for r in data["results"]], data["hacks"]
+
+
+def cache_put(key, results, hacks):
+    import json
+    db = cache_db()
+    db.execute("INSERT OR REPLACE INTO kept VALUES (?, ?)", (key, json.dumps({"results": results, "hacks": hacks})))
+    db.commit()
+
+
 def check_many(source, items, cc=None, flags=None, lint=True):
     """one compile for many functions of a source: [(status, differing words, open
-    relocations, size)] for each (where, symbol). the source's tricks are left in last_hacks."""
+    relocations, size)] for each (where, symbol). the source's tricks are left in last_hacks.
+    kept in build/<version>/check_cache.sqlite (see judge_stamp)."""
     global last_hacks
     cc, flags = cc or config.DEFAULT_CC, flags or config.DEFAULT_FLAGS
+    key = cache_key(source, items, cc, flags, lint)
+    got = cache_get(key)
+    if got is not None:
+        results, last_hacks = got
+        return results
+    results = check_many_compiled(source, items, cc, flags, lint)
+    cache_put(key, results, last_hacks)
+    return results
+
+
+def _check_job(job):
+    """a worker's check: compiled, not kept (the main process keeps them all at once)."""
+    source, items, cc, flags, lint, key = job
+    cc, flags = cc or config.DEFAULT_CC, flags or config.DEFAULT_FLAGS
+    results = check_many_compiled(source, items, cc, flags, lint)
+    return results, list(last_hacks)
+
+
+def cache_put_many(rows):
+    """[(key, results, tricks)] kept in one transaction."""
+    import json
+    db = cache_db()
+    db.executemany("INSERT OR REPLACE INTO kept VALUES (?, ?)",
+                   [(k, json.dumps({"results": r, "hacks": h})) for k, r, h in rows])
+    db.commit()
+
+
+def check_parallel(jobs, cc=None, flags=None, lint=True, workers=None):
+    """check_many on many sources at once: jobs [(source, items)] or [(source, items, text)]
+    -> [(results, tricks)], in order. with a text, the file is written only when its result
+    is not kept already. the sources must be different files."""
+    out, todo = [None] * len(jobs), []
+    cc_, flags_ = cc or config.DEFAULT_CC, flags or config.DEFAULT_FLAGS
+    prepared = []
+    for n, job in enumerate(jobs):                      # what the cache has, without a process
+        src, items = str(job[0]), list(job[1])
+        text = job[2] if len(job) > 2 else None
+        key = cache_key(src, items, cc_, flags_, lint, text)
+        got = cache_get(key)
+        if got is not None:
+            out[n] = got
+            continue
+        if text is not None:
+            Path(src).write_text(text, encoding="utf-8", newline="\n")
+        prepared.append((src, items, cc, flags, lint, key))
+        todo.append(n)
+    workers = workers or max(1, min(len(todo), (os.cpu_count() or 4) - 2))
+    if workers <= 1 or len(todo) <= 1:
+        for n, job in zip(todo, prepared):
+            out[n] = _check_job(job)
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for n, result in zip(todo, pool.map(_check_job, prepared, chunksize=1)):
+                out[n] = result
+    cache_put_many([(job[5], out[n][0], out[n][1]) for n, job in zip(todo, prepared)])
+    return out
+
+
+def check_many_compiled(source, items, cc, flags, lint=True):
+    """check_many without the cache."""
+    global last_hacks
     last_hacks = []
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "unit.o"
