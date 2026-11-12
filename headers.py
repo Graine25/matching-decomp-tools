@@ -243,10 +243,20 @@ def main():
         seen.add(a)
         return any(reaches(n, b, seen) for n in needs.get(a, ()))
 
+    written_by_person = {}
+
     def hand_written(c):
-        parts = c.split("::")
-        path = config.ROOT / "include" / Path(*parts[:-1], parts[-1] + ".h")
-        return path.exists() and not path.read_text(encoding="utf-8", errors="replace").startswith(MARK)
+        """whether the class's header is a person's (remembered: what this tool writes starts
+        with its mark, so the answer does not change during a run)."""
+        if c not in written_by_person:
+            parts = c.split("::")
+            path = config.ROOT / "include" / Path(*parts[:-1], parts[-1] + ".h")
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    written_by_person[c] = not f.read(len(MARK)).startswith(MARK)
+            except OSError:
+                written_by_person[c] = False
+        return written_by_person[c]
 
     # the slots a person declared in a header of theirs (a `// slot N` on the line): the classes
     # built on it take that name, those parameters and that return, so that they override it

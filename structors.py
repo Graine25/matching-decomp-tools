@@ -670,15 +670,27 @@ def main():
         for i in range(0, len(classes), CHUNK):
             path = work / f"{module.replace('.', '_')}_{i // CHUNK:03}.cpp"
             jobs.append((module, classes[i:i + CHUNK], path))
+    # a chunk that does not compile (two classes' headers that do not go together) is split in
+    # two, and the halves of every such chunk are checked side by side, a round at a time
     first = {}
-    checked = match.check_parallel([(p, [it for _, its, *_ in chunk for it in its],
-                                     source(chunk, "candidates of tools/structors.py")) for _, chunk, p in jobs])
-    for (module, chunk, path), (results, _) in zip(jobs, checked):
-        items = [it for _, its, *_ in chunk for it in its]
-        if all(r[0] == "error" for r in results) and len(chunk) > 1:
-            first.setdefault(module, {}).update(check(path, chunk, "candidates of tools/structors.py"))
-        else:
-            first.setdefault(module, {}).update({w: r[0] for (w, _), r in zip(items, results)})
+    rounds = 0
+    while jobs:
+        rounds += 1
+        checked = match.check_parallel([(p, [it for _, its, *_ in chunk for it in its],
+                                         source(chunk, "candidates of tools/structors.py")) for _, chunk, p in jobs])
+        again = []
+        for (module, chunk, path), (results, _) in zip(jobs, checked):
+            items = [it for _, its, *_ in chunk for it in its]
+            if all(r[0] == "error" for r in results) and len(chunk) > 1:
+                half = len(chunk) // 2
+                again.append((module, chunk[:half], path.with_name(path.stem + "a.cpp")))
+                again.append((module, chunk[half:], path.with_name(path.stem + "b.cpp")))
+            else:
+                first.setdefault(module, {}).update({w: r[0] for (w, _), r in zip(items, results)})
+        jobs = again
+    print(f"candidates checked in {rounds} rounds", flush=True)
+    # 1. per program, what matched, and the hosts each base's inline copies could go in
+    keeps, wanted = {}, {}              # module -> keep; (module, base) -> (copies, hosts)
     for module, classes in sorted(by_module.items()):
         status = first.get(module, {})
         keep = []
@@ -689,54 +701,85 @@ def main():
                         if status.get(w) != "match"]
             if good:
                 keep.append((cls, good, body, kind))
-        # the bases' inline virtual functions: in the file of one class built on each base
-        hosted = []
+        keeps[module] = keep
         for base, copies in sorted(inline_copies(module, classes).items()):
             # a host: a class built on the base, one that matches first, destructors before
-            # constructors (a constructor may leave the base's vtable out); the first of a few
-            # whose file emits the most copies
+            # constructors (a constructor may leave the base's vtable out)
             hosts = [e for e in keep if base in ancestors(e[0])]
             hosts += [(c, [], b, k) for c, _, b, k in classes if base in ancestors(c)
                       and not any(c == h[0] and k == h[3] for h in hosts)]
             hosts.sort(key=lambda e: (not e[1], e[3] != "dtor"))
-            best, best_good, best_results = None, [], None
-            for host in hosts[:6]:
-                host = (host[0], host[1], host[2], host[3])
-                path = work / f"{module.replace('.', '_')}_inline.cpp"
-                path.write_text(source([host + ([(base, copies)],)], "candidates of tools/structors.py"),
-                                encoding="utf-8", newline="\n")
-                results = match.check_many(path, host[1] + copies)
-                good = [c for c, r in zip(copies, results[len(host[1]):]) if r[0] == "match"]
-                if best is None or len(good) > len(best_good):
-                    best, best_good, best_results = host, good, results
-                if len(good) == len(copies):
-                    break
-            if best is None:
+            if hosts:
+                wanted[(module, base)] = (copies, [(h[0], h[1], h[2], h[3]) for h in hosts[:6]])
+
+    # 2. the hosts, a round at a time for every program side by side: the first host whose file
+    # emits all the copies, else the one that emits the most
+    best = {}                           # (module, base) -> (host, good copies, results)
+    for round_ in range(6):
+        jobs = []
+        for n, ((module, base), (copies, hosts)) in enumerate(sorted(wanted.items())):
+            done = best.get((module, base))
+            if round_ >= len(hosts) or (done and len(done[1]) == len(copies)):
                 continue
-            skipped += [(w, f"{base}'s inline copy: does not match ({r[0]})")
-                        for (w, _), r in zip(copies, best_results[len(best[1]):]) if r[0] != "match"]
-            if best_good or best[1]:
-                keep[:] = [e for e in keep if not (e[0] == best[0] and e[3] == best[3])]
-                hosted.append(best + ([(base, best_good)] if best_good else [],))
+            host = hosts[round_]
+            path = work / f"{module.replace('.', '_')}_inline_{n:03}_{round_}.cpp"
+            jobs.append(((module, base), host, copies, path))
+        if not jobs:
+            break
+        checked = match.check_parallel([(p, h[1] + c, source([h + ([(b[1], c)],)], "candidates of tools/structors.py"))
+                                        for b, h, c, p in jobs])
+        for (key, host, copies, _), (results, _) in zip(jobs, checked):
+            good = [c for c, r in zip(copies, results[len(host[1]):]) if r[0] == "match"]
+            if key not in best or len(good) > len(best[key][1]):
+                best[key] = (host, good, results)
+    hosted = {}                         # module -> [entries with their copies]
+    for (module, base), (host, good, results) in sorted(best.items()):
+        copies = wanted[(module, base)][0]
+        skipped += [(w, f"{base}'s inline copy: does not match ({r[0]})")
+                    for (w, _), r in zip(copies, results[len(host[1]):]) if r[0] != "match"]
+        if good or host[1]:
+            keeps[module] = [e for e in keeps[module] if not (e[0] == host[0] and e[3] == host[3])]
+            hosted.setdefault(module, []).append(host + ([(base, good)] if good else [],))
+
+    # 3. the files, every program's side by side, each checked as written; one where something
+    # does not match is split (write_checked), one at a time
+    files = []                          # (module, out folder, name, entries, note)
+    note_inline = ("written by tools/structors.py: a class built on a base whose header defines virtual "
+                   "functions inline, and the base's copies this file emits; each named one matches")
+    note_plain = "written by tools/structors.py: destructors and constructors from the headers; each matches"
+    for module in sorted(by_module):
         out = config.program_dir(module) / "generated"
         for old in out.glob("dtors_*.cpp"):
             old.unlink()
         out.mkdir(parents=True, exist_ok=True)
-        n = 0
-        for entry in hosted:
-            n, kept = write_checked(out, "dtors_inline", [entry],
-                                    "written by tools/structors.py: a class built on a base whose header defines "
-                                    "virtual functions inline, and the base's copies this file emits; each named one matches", n)
-            won += sum(len(e[1]) + sum(len(c) for _, c in e[4]) for e in kept)
-        n, written = 0, []
-        for i in range(0, len(keep), CHUNK):
-            n, kept = write_checked(out, "dtors", keep[i:i + CHUNK],
-                                    "written by tools/structors.py: destructors and constructors from the headers; each matches", n)
-            written += kept
-        lost = {w for e in keep for w, _ in e[1]} - {w for e in written for w, _ in e[1]}
+        for i, entry in enumerate(hosted.get(module, [])):
+            files.append((module, out, f"dtors_inline_{i:03}", [entry], note_inline))
+        for i in range(0, len(keeps[module]), CHUNK):
+            files.append((module, out, f"dtors_{i // CHUNK:03}", keeps[module][i:i + CHUNK], note_plain))
+
+    def named(entries):
+        return [it for e in entries for it in e[1]] + [c for e in entries for _, cs in (e[4] if len(e) > 4 else [])
+                                                      for c in cs]
+    checked = match.check_parallel([(out / f"{name}.cpp", named(entries), source(entries, note))
+                                    for _, out, name, entries, note in files])
+    written = {}
+    for (module, out, name, entries, note), (results, _) in zip(files, checked):
+        if all(r[0] == "match" for r in results):
+            (out / f"{name}.cpp").write_text(source(entries, note), encoding="utf-8", newline="\n")
+            kept = entries
+        else:
+            path = out / f"{name}.cpp"
+            if path.exists():
+                path.unlink()
+            _, kept = write_checked(out, name + "_part", entries, note)
+        written.setdefault(module, []).extend(kept)
+    for module in sorted(by_module):
+        kept = written.get(module, [])
+        lost = {w for e in keeps[module] for w, _ in e[1]} - {w for e in kept for w, _ in e[1]}
         skipped += [(w, "matches alone, not beside the other classes of its file") for w in sorted(lost)]
-        won += sum(len(g) for _, g, *_ in written)
-        print(f"{module}: {sum(len(g) for _, g, *_ in written)} of {sum(len(i) for _, i, *_ in classes)}", flush=True)
+        count = sum(len(e[1]) + sum(len(c) for _, c in (e[4] if len(e) > 4 else [])) for e in kept)
+        won += count
+        print(f"{module}: {count} of {sum(len(i) for _, i, *_ in by_module[module])}", flush=True)
     with open(config.BUILD / "structors_skipped.txt", "w", encoding="utf-8", newline="\n") as f:
         f.writelines(f"{where} {why}\n" for where, why in skipped)
     print(f"{won} destructors and constructors in src/<program>/generated/dtors_*.cpp; {len(skipped)} left "
