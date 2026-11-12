@@ -23,11 +23,15 @@ __cxxabiv1 = "armlib"
 
 [library_files]                  # a source file the game names -> its library
 
-[paths]                          # local helpers only (local/), relative to project.toml
-ida_databases = "build/ida"
-ghidra_project = "build/ghidra-project"
-ghidra_install = "../ghidra"
-
-[ghidra]                         # local/ghidra_server.py
-name = "project"
-port = 18970
+# one person's machine goes in project.local.toml beside this file, kept out of git: its
+# keys take the place of these, section by section. for example:
+#
+#   [paths]                      # local helpers only (local/), relative to the project's root
+#   ida_databases = "build/ida"
+#   ghidra_project = "build/ghidra-project"
+#   ghidra_install = "../ghidra"
+#   m2c = "../m2c/m2c.py"
+#
+#   [ghidra]                     # local/ghidra_server.py
+#   name = "project"
+#   port = 18970

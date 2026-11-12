@@ -108,10 +108,108 @@ def declaration(r):
     return f"{found[0].strip()}` in `{found[1]}" if found else None
 
 
+def mangled_class(cls):
+    return "".join(f"{len(p)}{p}" for p in cls.split("::"))
+
+
+def class_header(cls):
+    parts = cls.split("::")
+    path = config.ROOT / "include" / Path(*parts[:-1], parts[-1] + ".h")
+    return path if path.exists() else None
+
+
 def symbol_hint(r):
+    """what --sym is given: the start of the mangled name the source's definition makes. a
+    function its header declares: _ZN<class><name>; a destructor's: D1 (complete) or D0
+    (deleting); a secondary base's thunk of an override the header declares: _ZThn<n>_N..."""
+    import re
+    cls, slot = r["class"], r["slot"]
+    if cls and re.fullmatch(r"[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*", cls):
+        mangled = mangled_class(cls)
+        found = headers().get(f"{r['module']}:{r['start']}")
+        name = None
+        if found:
+            m = re.search(r"(~?[A-Za-z_]\w*)\s*\(", found[0])
+            name = m.group(1) if m else None
+        header = class_header(cls)
+        if name is None and slot in ("0", "1") and header and \
+                re.search(r"virtual\s+~" + re.escape(cls.split("::")[-1]) + r"\s*\(", header.read_text(encoding="utf-8", errors="replace")):
+            name = "~"
+        if name:
+            if slot.startswith("-"):
+                at = slot[1:].split(":")[0]
+                if not name.startswith("~"):
+                    return f"_ZThn{at}_N{mangled}{len(name)}{name}"
+            elif name.startswith("~"):
+                return f"_ZN{mangled}" + ("D1Ev" if slot == "0" else "D0Ev")
+            else:
+                return f"_ZN{mangled}{len(name)}{name}"
     if r["method"] and r["class"]:
         return r["method"]
     return f"sub_{r['start']}" if r["module"] == "code.bin" else f"f_{r['module']}_{r['start']}"
+
+
+_bases, _own = None, {}
+
+
+def own_members(cls):
+    """{offset: (type, name)} of the `// +0x..` lines of a class's own header."""
+    import re
+    if cls not in _own:
+        found = {}
+        header = class_header(cls)
+        if header:
+            text = header.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r"\b(?:class|struct)\s+" + re.escape(cls.split("::")[-1]) + r"\b[^;{]*\{", text)
+            for line in (text[m.end():] if m else "").splitlines():
+                mm = re.match(r"\s*(?P<decl>[^;/(){}=]+?);\s*//\s*\+0x(?P<off>[0-9a-fA-F]+)", line)
+                if not mm or line.lstrip().startswith(("virtual", "static", "typedef", "enum")):
+                    continue
+                dm = re.match(r"(?P<type>.*?[\s*&])(?P<name>[A-Za-z_]\w*)(?:\[[^\]]*\])?$", mm.group("decl").strip())
+                if dm and not dm.group("name").startswith("unk_"):
+                    found[int(mm.group("off"), 16)] = (dm.group("type").strip(), dm.group("name"))
+        _own[cls] = found
+    return _own[cls]
+
+
+def layout(cls, base=0, depth=0):
+    """{offset: (type, name, the class that declares it)} of a class and its bases."""
+    global _bases
+    if _bases is None:
+        _bases = {}
+        with open(config.CONFIG / "classes.csv", encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                _bases.setdefault(r["class"], [(b.rsplit(":", 1)[0], int(b.rsplit(":", 1)[1]))
+                                               for b in r["bases"].split() if ":" in b])
+    out = {}
+    if depth > 8:
+        return out
+    for b, off in _bases.get(cls, []):
+        out.update(layout(b, base + off, depth + 1))
+    for off, (t, n) in own_members(cls).items():
+        out[base + off] = (t, n, cls)
+    return out
+
+
+def offsets_used(r):
+    """the offsets the function loads and stores through `this` (tools/fields.py's walk: this in
+    r0, followed through copies and `add`), or set() when it cannot be followed."""
+    import fields
+    start, end = int(r["start"], 16), int(r["end"], 16)
+    if r["mode"] != "arm" or r["slot"].startswith("-"):
+        return set()                    # a thunk: this is adjusted first
+    got = fields.accesses(image(r["module"]), start, end)
+    return {off for off, _, _ in got[0]} if got else set()
+
+
+def members_used(r):
+    """the members of the function's class (its bases' included) at the offsets it uses."""
+    cls = r["class"]
+    if not cls:
+        return []
+    flat = layout(cls)
+    return [f"+{off:#x} `{t} {n}` ({owner})" for off in sorted(offsets_used(r)) if off in flat
+            for t, n, owner in [flat[off]]]
 
 
 def callees(r):
@@ -194,6 +292,9 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--module")
     p.add_argument("--list", help="a file of <where>, one a line: these functions instead of a sample")
+    p.add_argument("--decompiler", action="store_true",
+                   help="add a decompiler's C (Hex-Rays, else Ghidra, with the project's types): off by default, "
+                        "two A/B batches of 2026-11-12 found it no help to Haiku on small functions")
     p.add_argument("--m2c", action="store_true",
                    help="add m2c's C (local/m2cref.py) to each function: off by default, an A/B batch of "
                         "2026-11-12 found it no help to Haiku and two forced sources where it was given")
@@ -263,7 +364,7 @@ def main():
         print("not offered:", dict(reasons))
     listed = out / "list.txt"
     listed.write_text("\n".join(where(r).replace("0x", "0x") for r in rows) + "\n", encoding="utf-8")
-    decompiled = reference_c(rows, listed, out)
+    decompiled = reference_c(rows, listed, out) if a.decompiler else {}
 
     lines = []
     for n, funcs in enumerate(agents, 1):
@@ -289,6 +390,13 @@ def main():
             declared = declaration(r)
             if declared:
                 known.append(f"- declared: `{declared.strip()}`")
+            if r["slot"].startswith("-"):
+                known.append("- a thunk of a secondary base's vtable: write the override the header declares "
+                             "(the line above); the compiler makes this thunk from it, with this `//!` line")
+            used = members_used(r)
+            if used:
+                known.append("- members it reads or writes through this (its class's and its bases', in "
+                             "the headers): " + "; ".join(used))
             known.append(f"- the `//!` line: `//! {w} {symbol_hint(r)}` (the symbol: what you pass to --sym)")
             called = callees(r)
             if called:

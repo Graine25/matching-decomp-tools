@@ -4,8 +4,8 @@ The headless scripts open the project from scratch each time (a minute or
 two); this keeps it open in one process and answers over a local socket in
 seconds.
 
-    # once, in the background (needs a venv with pyghidra and JDK 25; here: ports/Solstice/build/pyghidra-venv)
-    ports/Solstice/build/pyghidra-venv/Scripts/python -I tools/local/ghidra_server.py serve
+    # once, in the background, with a Python that has pyghidra (and the JDK Ghidra asks for)
+    <venv>/Scripts/python -I tools/local/ghidra_server.py serve
 
     # then, from anywhere, with any Python
     python -I tools/local/ghidra_server.py decompile 0x4025CC
@@ -55,8 +55,8 @@ import re
 import socket
 import sys
 
-# a copy of decomp-tools' ghidra/ghidra_server.py (b610ae7 plus the table command), with
-# the paths its paths.py gave written here. the Ghidra project itself is not copied: it is
+# from the author's decomp-tools (ghidra/ghidra_server.py, b610ae7, plus the table and typed
+# commands), with its paths read from project.toml. the Ghidra project itself is not copied: it is
 # a database of the game, in the folder MATCH_GHIDRA_PROJECT names.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
@@ -87,7 +87,7 @@ def query(args):
                 data += chunk
     except ConnectionRefusedError:
         sys.exit("no Ghidra server on port %d; start it with: "
-                 "ports/Solstice/build/pyghidra-venv/Scripts/python -I tools/local/ghidra_server.py serve" % PORT)
+                 "<a Python with pyghidra> -I tools/local/ghidra_server.py serve" % PORT)
     return data.decode("utf-8", "replace")
 
 

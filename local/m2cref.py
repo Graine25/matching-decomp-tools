@@ -5,7 +5,7 @@
     python -I tools/local/m2cref.py --context <where>     prints the C context it gives m2c
 
 m2c (github.com/matt-kempster/m2c, GPL-3.0) is run as an outside program: M2C names its m2c.py
-(project.toml [paths] m2c, else ../resources/m2c/m2c.py). nothing of it is copied here. the
+(project.local.toml or project.toml [paths] m2c). nothing of it is copied here. the
 target is `ctr`, which only the local fork has (the 3DS: VFP, hard-float arguments); upstream m2c
 is run with `arm` instead.
 
@@ -56,7 +56,7 @@ def m2c_path():
         return Path(os.environ["M2C"])
     if "m2c" in config.PATHS:
         return config.PATHS["m2c"]
-    return config.ROOT.parent / "resources" / "m2c" / "m2c.py"
+    raise SystemExit("where is m2c? set M2C, or [paths] m2c = \"<its m2c.py>\" in project.local.toml")
 
 # ---------------------------------------------------------------- the project's tables
 

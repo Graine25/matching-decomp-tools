@@ -60,6 +60,11 @@ def find_root():
 
 ROOT = find_root()
 PROJECT = read_toml(ROOT / "project.toml")
+# project.local.toml (beside it, kept out of git): one person's machine, e.g. [paths] and
+# [ghidra]. its keys take the place of project.toml's, section by section.
+if (ROOT / "project.local.toml").exists():
+    for _section, _keys in read_toml(ROOT / "project.local.toml").items():
+        PROJECT.setdefault(_section, {}).update(_keys)
 MAIN = PROJECT["project"]["main"]
 OWN = tuple(PROJECT["project"].get("own", ["game"]))     # the libraries to decompile
 VERSION = os.environ.get("MATCH_VERSION", MAIN)

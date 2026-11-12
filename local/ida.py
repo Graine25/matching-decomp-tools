@@ -6,9 +6,9 @@
     py -3.12 tools/local/ida.py starts code.bin [Battle ...]        # build/us-v1.2/ida/<program>.starts.txt
     py -3.12 tools/local/ida.py starts all                          # every database
 
-a local helper (not part of the repository), after decomp-tools' ida/decompile.py. it reads
-the databases the Solstice port already has (ports/Solstice/build/ida/<program>.i64: code.bin
-and one per module, addressed by file offset as everything here is) and never saves them.
+a local helper, after the author's decomp-tools (ida/decompile.py). it reads the IDA
+databases the project names (project.toml [paths] ida_databases: <program>.i64, code.bin and
+one per module, addressed by file offset as everything here is) and never saves them.
 
 --types DIR: DIR/<program>.json from tools/typecontext.py (`--out DIR @list.txt`, with the
 project's Python: it needs the tables and capstone): its declarations go into the database's
@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config                       # the decomp: project.toml's [paths] ida_databases
 
 ROOT = config.ROOT
-DATABASES = config.PATHS["ida_databases"]
+DATABASES = config.PATHS.get("ida_databases", config.ROOT / "build" / "ida")
 OUT = config.ROOT / "build" / config.MAIN / "ida"
 
 import idapro  # first: it loads IDA

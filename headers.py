@@ -37,7 +37,8 @@ class lands on the right slot. what the game does not say is a placeholder:
 - a return type from returns.csv that names a class is declared ahead (a class nested in
   another cannot be), one that names an enum brings its header: a struct returned by value
   is written there like any type;
-- data members come from tools/fields.py (config/<version>/fields.csv: what the
+- data members come from tools/fields.py and from config/<version>/members.csv (members a
+  person gives, with the evidence; they win at their offset) (config/<version>/fields.csv: what the
   class's functions read and write through `this`): `field_<offset>` with the
   width seen, `unk_<offset>` for the bytes between that nothing was seen to
   use. names and exact types are guesses, and say so. every member's offset is
@@ -211,6 +212,17 @@ def main():
             if b0 not in m.primary and not m.parents.get(b0):
                 lone_first.add(b0)
     members = fieldslib.load()
+    # members a person gives (config/<version>/members.csv: class, offset (hex), width, type as
+    # fields.csv's, of, evidence): they take the place of what fields.py found at that offset
+    manual_why = {}
+    manual_path = config.CONFIG / "members.csv"
+    if manual_path.exists():
+        with open(manual_path, encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                cls, off = r["class"], int(r["offset"], 16)
+                members[cls] = [e for e in members.get(cls, []) if e[0] != off] + \
+                    [(off, int(r["width"]), r["type"], 0, r.get("of") or "")]
+                manual_why[(cls, off)] = r["evidence"]
     from_exports = fieldslib.named_classes(m.parents)
     static = crolib.Cro(config.ORIG / "romfs" / "static.crs").exports()
     mangled_at = {addr: name for name, addr in static.items()}
@@ -263,6 +275,7 @@ def main():
     slot_line = re.compile(r"virtual\s+(?P<ret>[\w:<>\s\*&]*?)\s*\b(?P<name>\w+)\s*\((?P<params>[^()]*)\)\s*"
                            r"(?P<const>const)?\s*(?:=\s*0\s*)?(?:\{[^{}\n]*\}|;)[^\n]*?//[^\n]*?\bslot\s+(?P<slot>\d+)")
     declared_slots = {}
+    override_cache = {}
 
     def class_body(text, short):
         """the braced body of `class <short>` in text, its nested classes cut out, or None."""
@@ -277,21 +290,23 @@ def main():
                 return text[i:j + 1]
         return None
 
-    def person_slots(c):
-        """{slot: (name, parameters, return, const)} of a class whose header a person wrote."""
-        if c in declared_slots:
-            return declared_slots[c]
-        declared_slots[c] = {}
+    def person_slots(c, any_header=False):
+        """{slot: (name, parameters, return, const)} of a class whose header a person wrote (or, with
+        any_header, whatever wrote it: the slots as its header on disk declares them)."""
+        key = (c, any_header)
+        if key in declared_slots:
+            return declared_slots[key]
+        declared_slots[key] = {}
         top = header_of.get(c)
-        if top is None or not hand_written(top):
-            return declared_slots[c]
+        if top is None or (not any_header and not hand_written(top)):
+            return declared_slots[key]
         parts = top.split("::")
         text = (config.ROOT / "include" / Path(*parts[:-1], parts[-1] + ".h")).read_text(encoding="utf-8", errors="replace")
         body = class_body(text, parts[-1])
         for inner in c.split("::")[len(parts):]:
             body = class_body(body, inner) if body else None
         if not body:
-            return declared_slots[c]
+            return declared_slots[key]
         own = body[1:]
         for inner in re.finditer(r"\b(?:class|struct)\s+\w+[^;{]*\{", body[1:]):
             nested = class_body(body[1:][inner.start():], re.search(r"(?:class|struct)\s+(\w+)", inner.group(0)).group(1))
@@ -307,9 +322,9 @@ def main():
                 t = re.sub(r"(?<![\w:])" + re.escape(n) + r"\b", f"::{ns}::{n}" if ns else f"::{n}", t)
             return t
         for m_ in slot_line.finditer(own):
-            declared_slots[c][int(m_.group("slot"))] = (m_.group("name"), qualify(m_.group("params").strip()),
-                                                        qualify(" ".join(m_.group("ret").split())), bool(m_.group("const")))
-        return declared_slots[c]
+            declared_slots[key][int(m_.group("slot"))] = (m_.group("name"), qualify(m_.group("params").strip()),
+                                                          qualify(" ".join(m_.group("ret").split())), bool(m_.group("const")))
+        return declared_slots[key]
 
     def person_slot(c, i):
         """the slot i as a person declared it in c or in the bases it shares its vtable with."""
@@ -856,8 +871,13 @@ def main():
                             t = f"::{inner} *"
                             member_ahead.setdefault(cls, set()).add(need[1])
                             what = f"a pointer to {inner} (the class of what it is passed to as this), "
-                    lines.append(f"    {t}{'' if t.endswith('*') else ' '}field_{off:X};  // +{off:#x}, a guess: "
-                                 f"{what}from {seen}")
+                    why = manual_why.get((cls, off))
+                    if why:
+                        lines.append(f"    {t}{'' if t.endswith('*') else ' '}field_{off:X};  // +{off:#x}: {why} "
+                                     f"(members.csv)")
+                    else:
+                        lines.append(f"    {t}{'' if t.endswith('*') else ' '}field_{off:X};  // +{off:#x}, a guess: "
+                                     f"{what}from {seen}")
                     offsets.append(off)
                     align = max(align, width)
                     cur = off + width
@@ -894,6 +914,97 @@ def main():
             shown = slot_return.get((m.introducer(cls, i), i))
             return (shown[0], shown[1], True) if shown else ("void", None, False)
 
+        def overrides_of(cls):
+            """{new slot of the class's primary vtable: (secondary base, its slot, the base's offset,
+            the thunk)}: the class's own functions that override a secondary base's. the Itanium ABI
+            gives such an overrider a new slot in the primary vtable, and the base's vtable a thunk
+            that adjusts this. armcc writes the thunk as `sub r0, r0, #n` and the body again; the slot
+            whose body is the same (branches, push, pop and the sub left out), and the only one, is the override."""
+            if cls in override_cache:
+                return override_cache[cls]
+            override_cache[cls] = found = {}
+            if cls not in m.primary:
+                return found
+            module, slots = m.primary[cls]
+            first = next((b for b, off in m.parents.get(cls, []) if off == 0), None)
+            start_new = len(m.primary[first][1]) if first in m.primary else 0
+
+            def words(where):
+                row = function_of.get(where)
+                if row is None or row["mode"] != "arm":
+                    return None
+                if where[0] not in images:
+                    try:
+                        images[where[0]] = config.Image(where[0])
+                    except OSError:
+                        images[where[0]] = None
+                img = images[where[0]]
+                return None if img is None else [img.word(a) for a in range(where[1], int(row["end"], 16), 4)]
+
+            def shape(ws):
+                out = Counter()
+                for w in ws:
+                    if (w & 0x0E000000) == 0x0A000000 or (w & 0x0FFF0000) in (0x092D0000, 0x08BD0000) \
+                            or (w & 0x0FFFFFFF) in (0x01A00000, 0x012FFF1E) or (w & 0x0FFFF000) == 0x02400000:
+                        continue
+                    out[w & 0x0FFFFFFF] += 1
+                return out
+
+            new = {}
+            for i in range(start_new, len(slots)):
+                where = m.target_function(slots[i][0])
+                row = function_of.get(where) if where else None
+                if row is not None and row["class"] == cls:
+                    ws = words(where)
+                    if ws is not None:
+                        new[i] = (where, shape(ws))
+            taken = set()
+            for (vmodule, _), (vcls, top, vslots) in m.vtables.items():
+                if vcls != cls or top == 0 or vmodule != module:
+                    continue
+                base = next((b for b, off in m.parents.get(cls, []) if off == -top), None)
+                if base is None:
+                    continue
+                for k, (target, _) in enumerate(vslots):
+                    where = m.target_function(target)
+                    row = function_of.get(where) if where else None
+                    if row is None or row["class"] != cls or not row["slot"].startswith("-"):
+                        continue        # the base's own function, not overridden here
+                    ws = words(where)
+                    if not ws:
+                        continue
+                    best = None
+                    # `sub r0, r0, #n; b <the override>`: the thunk names it
+                    if len(ws) >= 2 and (ws[0] & 0x0FFFF000) == 0x02400000 and (ws[1] & 0x0F000000) == 0x0A000000:
+                        off = ws[1] & 0xFFFFFF
+                        dest = where[1] + 4 + 8 + 4 * (off - 0x1000000 if off & 0x800000 else off)
+                        best = next((i for i, (w2, _) in new.items() if w2[1] == dest), None)
+                    if best is None:
+                        mine = shape(ws)
+                        scored = []
+                        for i, (_, theirs) in new.items():
+                            if i in taken:
+                                continue
+                            if mine and mine == theirs:      # the same body: nothing less will do
+                                scored.append(i)
+                        if len(scored) == 1:
+                            best = scored[0]
+                    if best is not None and best not in taken:
+                        taken.add(best)
+                        found[best] = (base, k, -top, f"{where[0]}:{where[1]:08X}")
+            return found
+
+        def overriding_slot(base, k):
+            """(return, name, parameters, const) of slot k of a base as its header (or its bases')
+            declares it, or None."""
+            c = base
+            while c is not None:
+                got = person_slots(c, any_header=True).get(k)
+                if got:
+                    return got[2] or "void", got[0], got[1], got[3]
+                c = next((b for b, off in m.parents.get(c, []) if off == 0), None)
+            return None
+
         def class_block(cls, indent):
             """(the lines of a class's definition, the headers it needs, the classes to declare ahead)."""
             short = cls.rsplit("::", 1)[-1]
@@ -907,11 +1018,24 @@ def main():
             sigs = slot_sigs(cls)
             home = header_of[cls]
             lines, i, dtor_done, ahead, wanted = [], 0, False, set(), set()
+            overriders = overrides_of(cls)
+            chain_names = set(names)
             while i < len(slots):
                 target = slots[i][0]
                 name = names[i]
                 new = i >= inherited
                 changed = new or i >= len(base_slots) or base_slots[i][0] != target
+                if new and i in overriders:
+                    other, k, at, thunk = overriders[i]
+                    declared = overriding_slot(other, k)
+                    if declared and declared[1] not in chain_names - {name} and declared[1] != name:
+                        result, oname, params, const = declared
+                        gap = "" if result.endswith("*") else " "
+                        lines.append(f"    virtual {result}{gap}{oname}({params}){' const' if const else ''};  "
+                                     f"// overrides {other}'s slot {k}, through the base at +{at:#x} (its thunk "
+                                     f"{thunk})  // slot {i}, {target}")
+                        i += 1
+                        continue
                 if name == "~":
                     if not dtor_done and changed:
                         lines.append(f"    virtual ~{short}();")

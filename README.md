@@ -5,7 +5,9 @@ first made for Pokémon Ultra Sun and Ultra Moon (3DS). The compiler is the judg
 matched when armcc turns its source into the game's bytes.
 
 The tools hold no game data. They work on a decomp project: the folder with a `project.toml`
-(the current folder or one above it, or the one `MATCH_PROJECT` names). Use them as that
+(the current folder or one above it, or the one `MATCH_PROJECT` names). What is one person's
+machine (the paths of Ghidra, IDA's databases, m2c) goes in a `project.local.toml` beside it,
+kept out of git; its keys take the place of `project.toml`'s. Use them as that
 project's `tools/` folder (a git submodule), and run them from the project's root:
 
 ```sh
@@ -17,6 +19,7 @@ python -I tools/refresh.py            # the whole chain, after new sources
 
 ```
 project.toml          versions, compiler, flags, libraries (see project.example.toml)
+project.local.toml    your machine's paths, out of git (optional)
 orig/<version>/       the game's files, your own copy: exefs/code.bin, exheader.bin, romfs/*.cro
 toolchain/armcc/      the compilers (decomp.me's armcc builds)
 config/<version>/     the tables the tools write and read (functions.csv, classes.csv, ...)
@@ -53,7 +56,7 @@ The structure, from the game's own code and RTTI:
 | `fields.py` | data members from how functions use `this`; pointers typed by what they are passed to; objects inside |
 | `enums.py`, `callers.py`, `slotargs.py` | enums and their sizes from the callers; return types from what callers do; a function's parameters from what it reads |
 | `typecontext.py` | a C context of the classes for a decompiler (m2c, IDA, Ghidra): a struct per class with its members, its vtable as a struct of the slots' names, prototypes with `this` typed and as many parameters as the code reads |
-| `headers.py` | a header per class: bases, virtual functions by slot, members (offsets checked by the compiler), `X();` when the class has a constructor that reads nothing but `this`; a hand-written header's slots and size followed by the classes built on it |
+| `headers.py` | a header per class: bases, virtual functions by slot, members (offsets checked by the compiler), `X();` when the class has a constructor that reads nothing but `this`; the overrides of a secondary base's virtual functions (the new primary slot whose body is the thunk's), with that base's name and signature; members a person gives in `config/<version>/members.csv` (with the evidence) over the guessed ones; a hand-written header's slots and size followed by the classes built on it |
 
 Writing functions without a person:
 
@@ -69,8 +72,9 @@ Writing functions without a person:
 
 `local/`: helpers that need more than the project (`ghidra_server.py`, `ida.py`, `idastarts.py`; both
 decompilers take `typecontext.py`'s context: `ida.py c --types DIR`, the server's `typed` command,
-applied and never saved; `packets.py` uses IDA's Hex-Rays when its databases are there, else
-Ghidra's server), or
+applied and never saved; `packets.py --decompiler` uses IDA's Hex-Rays when its databases are
+there, else Ghidra's server; off by default, as is `--m2c`: a packet gives the declaration, the
+`--sym` the definition mangles to, and the members at the offsets the function uses), or
 that serve agents and people (`packets.py`, `permute.py`, a permuter for C++ sources;
 `m2cref.py`, [m2c](https://github.com/matt-kempster/m2c)'s C for a function, a reference only: m2c is
 GPL-3.0 and is run as an outside program, nothing of it is in this repository. It gives m2c a C
@@ -99,6 +103,24 @@ Ghidra 12 with pyghidra for `functable.py`; IDA 9 with idalib for `local/ida.py`
 No game bytes, assembly or tables in a tool or in what a tool writes to a project's kept folders
 (`config/`, `src/`, `include/`): addresses, sizes and names only. Their input is your own copy of
 the game and public tools, nothing else.
+
+## Credits
+
+- [decomp.me](https://decomp.me) and [decompme/compilers](https://github.com/decompme/compilers):
+  the armcc builds the tools compile with. armcc (ARM Compiler) is Arm's.
+- [Capstone](https://www.capstone-engine.org/) (BSD): the disassembler every tool reads code with.
+- [objdiff](https://github.com/encounter/objdiff) by encounter: what `objexport.py` writes for.
+- [Ghidra](https://github.com/NationalSecurityAgency/ghidra) (Apache-2.0) and
+  [pyghidra](https://pypi.org/project/pyghidra/): `functable.py`, `local/ghidra_server.py`.
+- IDA and idalib by [Hex-Rays](https://hex-rays.com/) (commercial, optional): `local/ida.py`.
+- [m2c](https://github.com/matt-kempster/m2c) by Matt Kempster and contributors (GPL-3.0), run
+  by `local/m2cref.py`.
+- [decomp-permuter](https://github.com/simonlindholm/decomp-permuter) by Simon Lindholm: the idea
+  of `local/permute.py` (written here for C++ and armcc; none of its code).
+- [3dbrew](https://www.3dbrew.org/): the CRO format (`cro.py`).
+- The [Itanium C++ ABI](https://itanium-cxx-abi.github.io/cxx-abi/abi.html): mangled names,
+  vtables, thunks, the constructor and destructor variants.
+- `local/ghidra_server.py` and `local/ida.py` began in the author's own decomp-tools.
 
 ## License
 
