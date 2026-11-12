@@ -16,6 +16,10 @@ seconds.
 
 Commands:
     decompile <f>          C of a function, with its callers
+    typed <context.json> <offset>...  C of these functions of one program, with the
+                           project's types first (tools/typecontext.py's file for that
+                           program): declarations and prototypes are applied in a
+                           transaction that is undone after, nothing is saved
     disasm <f> [count]     its instructions
     callers <f>            the functions calling it
     functions <program>    every function: offset, size, name | offsets it calls
@@ -181,6 +185,58 @@ class Server:
         head = (f"/* {name} {f.getName(True)} at {f.getEntryPoint()}, {f.getBody().getNumAddresses()} bytes;"
                 f" called from: {', '.join(callers) or 'nothing found (virtual?)'} */\n")
         return head + result.getDecompiledFunction().getC()
+
+    def cmd_typed(self, context, *offsets):
+        """the C of functions of one program after the project's types are in (undone after)"""
+        import json
+        from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+        from ghidra.app.util.cparser.C import CParser
+        from ghidra.program.model.symbol import SourceType
+        from ghidra.util.task import TaskMonitor
+        ctx = json.load(open(context, encoding="utf-8"))
+        module = os.path.basename(context)[:-5].replace("code_bin", "code.bin")
+        name = module if module == "code.bin" else f"{module}.cro"
+        program, _, decompiler = self.program(name)
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        functions = program.getFunctionManager()
+        report = {"applied": 0, "refused": 0}
+        out = []
+        transaction = program.startTransaction("typed (undone)")
+        try:
+            manager = program.getDataTypeManager()
+            try:
+                CParser(manager, True, None).parse(ctx["decls"])
+            except Exception as error:
+                out.append(f"/* the declarations: {error} */")
+            parser = CParser(manager)
+            for offset, prototype in ctx["functions"].items():
+                function = functions.getFunctionAt(space.getAddress(int(offset, 16)))
+                try:
+                    if function is None:
+                        raise ValueError("no function")
+                    definition = parser.parse(prototype)
+                    ApplyFunctionSignatureCmd(function.getEntryPoint(), definition,
+                                              SourceType.USER_DEFINED).applyTo(program, TaskMonitor.DUMMY)
+                    report["applied"] += 1
+                except Exception:
+                    report["refused"] += 1
+            decompiler.flushCache()
+            for offset in offsets:
+                address = space.getAddress(int(offset, 16))
+                where = f"0x{int(offset, 16):08X}" if module == "code.bin" else f"{module}:0x{int(offset, 16):08X}"
+                function = functions.getFunctionAt(address)
+                if function is None:
+                    out.append(f"=== {where}\n(no function there)")
+                    continue
+                result = decompiler.decompileFunction(function, 120, self.monitor)
+                c = result.getDecompiledFunction().getC() if result.decompileCompleted() \
+                    else f"(could not decompile: {result.getErrorMessage()})"
+                out.append(f"=== {where}\n{c.replace(chr(13), '').strip()}")      # Ghidra ends lines with \r\n
+        finally:
+            program.endTransaction(transaction, False)      # undone: the project is shared
+            decompiler.flushCache()
+        head = f"/* {name}: {report['applied']} prototypes applied, {report['refused']} refused */"
+        return head + "\n" + "\n".join(out) + "\n"
 
     def cmd_disasm(self, target, count="200"):
         name, program, f = self.function(target)

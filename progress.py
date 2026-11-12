@@ -97,7 +97,7 @@ class Keys:
 
 def main():
     config.options(__doc__, "--all", paths=True)
-    roots = [Path(a) for a in sys.argv[1:] if a != "--all"] or [config.ROOT / "src"]
+    roots = [Path(a).resolve() for a in sys.argv[1:] if a != "--all"] or [config.ROOT / "src"]
     files = []
     for root in roots:
         files += [root] if root.is_file() else sorted(f for f in root.rglob("*") if f.suffix in (".c", ".cpp"))

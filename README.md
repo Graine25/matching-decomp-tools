@@ -52,6 +52,7 @@ The structure, from the game's own code and RTTI:
 | `rtti.py`, `ctors.py`, `classify.py` | classes and vtables from the RTTI, who writes each vtable, each function's class, slot, method and library (a slot pair is the destructor when the second one's last word is the tail call that frees the object) |
 | `fields.py` | data members from how functions use `this`; pointers typed by what they are passed to; objects inside |
 | `enums.py`, `callers.py`, `slotargs.py` | enums and their sizes from the callers; return types from what callers do; a function's parameters from what it reads |
+| `typecontext.py` | a C context of the classes for a decompiler (m2c, IDA, Ghidra): a struct per class with its members, its vtable as a struct of the slots' names, prototypes with `this` typed and as many parameters as the code reads |
 | `headers.py` | a header per class: bases, virtual functions by slot, members (offsets checked by the compiler), `X();` when the class has a constructor that reads nothing but `this`; a hand-written header's slots and size followed by the classes built on it |
 
 Writing functions without a person:
@@ -66,7 +67,10 @@ Writing functions without a person:
 
 3DS: `cro.py` (CRO modules: segments, relocations, imports, exports).
 
-`local/`: helpers that need more than the project (`ghidra_server.py`, `ida.py`, `idastarts.py`), or
+`local/`: helpers that need more than the project (`ghidra_server.py`, `ida.py`, `idastarts.py`; both
+decompilers take `typecontext.py`'s context: `ida.py c --types DIR`, the server's `typed` command,
+applied and never saved; `packets.py` uses IDA's Hex-Rays when its databases are there, else
+Ghidra's server), or
 that serve agents and people (`packets.py`, `permute.py`, a permuter for C++ sources;
 `m2cref.py`, [m2c](https://github.com/matt-kempster/m2c)'s C for a function, a reference only: m2c is
 GPL-3.0 and is run as an outside program, nothing of it is in this repository. It gives m2c a C

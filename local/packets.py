@@ -137,6 +137,53 @@ def callees(r):
     return out[:8]
 
 
+def reference_c(rows, listed, out):
+    """{(module, start): (decompiler, C)} of the batch's functions, with the project's types
+    first (tools/typecontext.py): Hex-Rays' when the IDA databases are there (local/ida.py),
+    else Ghidra's (local/ghidra_server.py, its server running), else none."""
+    import json
+    import typecontext
+    types = out / "types"
+    types.mkdir(parents=True, exist_ok=True)
+    context = typecontext.program_context(listed.read_text(encoding="utf-8").split())
+    for module, ctx in context.items():
+        (types / f"{module.replace('.', '_')}.json").write_text(json.dumps(ctx), encoding="utf-8")
+    found = {}
+    databases = config.PATHS.get("ida_databases")
+    if databases and any(Path(databases).glob("*.i64")):
+        ida = out / "ida"
+        r = subprocess.run(["py", "-3.12", str(Path(__file__).with_name("ida.py")), "c", "--types", str(types),
+                            "--out", str(ida), f"@{listed}"], capture_output=True, text=True)
+        if r.returncode:
+            print("ida.py failed:", r.stderr.strip()[-300:])
+        for r_ in rows:
+            c = ida / f"{r_['module'].replace('.', '_')}_{int(r_['start'], 16):08X}.c"
+            if c.exists():
+                found[(r_["module"], int(r_["start"], 16))] = ("Hex-Rays", c.read_text(encoding="utf-8"))
+        if found:
+            return found
+    # Ghidra: one request per program to the server
+    server = Path(__file__).with_name("ghidra_server.py")
+    by_module = defaultdict(list)
+    for r_ in rows:
+        by_module[r_["module"]].append(int(r_["start"], 16))
+    for module, starts in sorted(by_module.items()):
+        ctx = types / f"{module.replace('.', '_')}.json"
+        if not ctx.exists():
+            continue
+        r = subprocess.run([sys.executable, "-I", str(server), "typed", str(ctx)] + [f"{s_:X}" for s_ in starts],
+                           capture_output=True, text=True)
+        if r.returncode or "=== " not in r.stdout:
+            print("no Ghidra server, or it failed: packets go without a decompiler's C:",
+                  (r.stderr or r.stdout).strip()[-200:])
+            break
+        for chunk in r.stdout.split("=== ")[1:]:
+            head, _, body = chunk.partition("\n")
+            mod, _, addr = head.strip().rpartition(":")
+            found[(mod or "code.bin", int(addr, 16))] = ("Ghidra", body)
+    return found
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--name", required=True)
@@ -147,6 +194,9 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--module")
     p.add_argument("--list", help="a file of <where>, one a line: these functions instead of a sample")
+    p.add_argument("--m2c", action="store_true",
+                   help="add m2c's C (local/m2cref.py) to each function: off by default, an A/B batch of "
+                        "2026-11-12 found it no help to Haiku and two forced sources where it was given")
     p.add_argument("--ready", action="store_true",
                    help="only functions of classes that are ready: built on a header a person wrote (theirs or a base's)")
     a = p.parse_args()
@@ -213,11 +263,7 @@ def main():
         print("not offered:", dict(reasons))
     listed = out / "list.txt"
     listed.write_text("\n".join(where(r).replace("0x", "0x") for r in rows) + "\n", encoding="utf-8")
-    ida = out / "ida"
-    r = subprocess.run(["py", "-3.12", str(Path(__file__).with_name("ida.py")), "c", "--out", str(ida), f"@{listed}"],
-                       capture_output=True, text=True)
-    if r.returncode:
-        print("ida.py failed, packets go without Hex-Rays' C:", r.stderr.strip()[-300:])
+    decompiled = reference_c(rows, listed, out)
 
     lines = []
     for n, funcs in enumerate(agents, 1):
@@ -259,10 +305,10 @@ def main():
                                            env=dict(__import__("os").environ, MATCH_VERSION=version))
                     text += [f"Not the same code in {version} (AGENTS.md, \"Versions\"): check with "
                              f"`MATCH_VERSION={version}` too.", "```", other.stdout.rstrip(), "```", ""]
-            c = ida / f"{r['module'].replace('.', '_')}_{start:08X}.c"
-            if c.exists():
-                text += ["Hex-Rays (a reference of what it does, not a draft):", "```c", c.read_text(encoding="utf-8").rstrip(), "```", ""]
-            if r["mode"] == "arm":
+            found = decompiled.get((r["module"], start))
+            if found:
+                text += [f"{found[0]} (a reference of what it does, not a draft):", "```c", found[1].rstrip(), "```", ""]
+            if a.m2c and r["mode"] == "arm":
                 try:
                     sys.path.insert(0, str(Path(__file__).resolve().parent))
                     import m2cref                       # m2c, run as an outside program (GPL-3.0)

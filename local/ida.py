@@ -2,12 +2,18 @@
 
     py -3.12 tools/local/ida.py c 0x003D6790 Battle:0x4F508 ...   # the C of each function
     py -3.12 tools/local/ida.py c --out build/us-v1.2/ida @list.txt   # one file each, from a list
+    py -3.12 tools/local/ida.py c --types DIR --out OUT @list.txt     # with the project's types first
     py -3.12 tools/local/ida.py starts code.bin [Battle ...]        # build/us-v1.2/ida/<program>.starts.txt
     py -3.12 tools/local/ida.py starts all                          # every database
 
 a local helper (not part of the repository), after decomp-tools' ida/decompile.py. it reads
 the databases the Solstice port already has (ports/Solstice/build/ida/<program>.i64: code.bin
 and one per module, addressed by file offset as everything here is) and never saves them.
+
+--types DIR: DIR/<program>.json from tools/typecontext.py (`--out DIR @list.txt`, with the
+project's Python: it needs the tables and capstone): its declarations go into the database's
+local types and its prototypes onto the functions before Hex-Rays reads them, so the C names
+the classes' members and virtual functions. none of it is saved.
 
 Hex-Rays' C is a reference for what a function does. it is not a draft to repair into a
 match, and none of it goes into the repository.
@@ -28,6 +34,7 @@ OUT = config.ROOT / "build" / config.MAIN / "ida"
 import idapro  # first: it loads IDA
 
 import ida_funcs  # noqa: E402
+import idc  # noqa: E402
 import ida_hexrays  # noqa: E402
 import ida_idp  # noqa: E402
 import ida_segregs  # noqa: E402
@@ -66,11 +73,31 @@ def c_of(address):
         return f"(Hex-Rays failed: {failure})"
 
 
+def apply_types(path):
+    """a program's context from tools/typecontext.py into the open database (not saved):
+    (prototypes applied, prototypes refused, declaration errors)."""
+    import json
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    flags = idc.PT_SILENT | getattr(idc, "PT_REPLACE", 0)
+    errors = idc.parse_decls(ctx["decls"], flags)
+    applied = refused = 0
+    for offset, prototype in ctx["functions"].items():
+        if idc.SetType(int(offset, 16), prototype):
+            applied += 1
+        else:
+            refused += 1
+    return applied, refused, errors
+
+
 def command_c(args):
-    out = None
-    if args[:1] == ["--out"]:
-        out, args = Path(args[1]), args[2:]
-        out.mkdir(parents=True, exist_ok=True)
+    out = types = None
+    while args[:1] in (["--out"], ["--types"]):
+        if args[0] == "--out":
+            out = Path(args[1])
+            out.mkdir(parents=True, exist_ok=True)
+        else:
+            types = Path(args[1])
+        args = args[2:]
     wheres = []
     for a in args:
         wheres += Path(a[1:]).read_text(encoding="utf-8").split() if a.startswith("@") else [a]
@@ -82,6 +109,11 @@ def command_c(args):
         if not opened(program):
             continue
         try:
+            context = types / f"{program.replace('.', '_')}.json" if types else None
+            if context and context.exists():
+                applied, refused, errors = apply_types(context)
+                print(f"{program}: {applied} prototypes applied, {refused} refused, "
+                      f"{errors} declaration errors", file=sys.stderr)
             for address in addresses:
                 text = c_of(address)
                 if out:
