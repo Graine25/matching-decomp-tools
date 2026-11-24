@@ -335,7 +335,7 @@ def compare_thumb(image, addr, code, relocs, obj):
     return out
 
 
-NOP, BX_LR = 0xE1A00000, 0xE12FFF1E
+NOP, BX_LR, MOV_PC_LR = 0xE1A00000, 0xE12FFF1E, 0xE1A0F00E
 _modes = {}
 
 
@@ -363,10 +363,11 @@ def inlined(image, target):
         return NOP if image.bytes(target & ~1, 2) == b"\x70\x47" else None
     if mode != "arm":
         return None
+    returns = (BX_LR, MOV_PC_LR)
     first = image.word(target)
-    if first == BX_LR:
+    if first in returns:
         return NOP
-    if image.word(target + 4) != BX_LR or first >> 28 != 0xE or first == NOP:
+    if image.word(target + 4) not in returns or first >> 28 != 0xE or first == NOP:
         return None
     if (first >> 26) & 3 == 3 or (first >> 25) & 7 == 5:      # coprocessor (VFP), branch
         return None
